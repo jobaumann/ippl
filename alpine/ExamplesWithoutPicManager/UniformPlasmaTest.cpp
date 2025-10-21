@@ -252,6 +252,9 @@ int main(int argc, char* argv[]) {
                     << endl;
                 break;
             }
+
+            // Uncomment to store particle density VTK files
+            // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
         }
 
         msg << "Uniform Plasma Test: End." << endl;
