@@ -110,7 +110,7 @@ int main(int argc, char* argv[]) {
         Vector_t<double, Dim> rmin(0.0);
         Vector_t<double, Dim> rmax(20.0);
 
-        Vector_t<double, Dim> hr     = rmax / nr;
+        Vector_t<double, Dim> hr     = (rmax-rmin) / nr;
         Vector_t<double, Dim> origin = rmin;
         const double dt              = 1.0;
 
@@ -194,8 +194,10 @@ int main(int argc, char* argv[]) {
             // all the particles hence eliminating the need to store mass as
             // an attribute
             // kick
+            // oscillating E field to test independent particle motion
             IpplTimings::startTimer(PTimer);
-            P->P = P->P - 0.5 * dt * P->E;
+            // P->P = P->P - 0.5 * dt * P->E;
+            P->P = P->P - 0.5 * dt * std::sin(0.1 * P->time_m);
             IpplTimings::stopTimer(PTimer);
 
             // What does this do?
@@ -240,8 +242,10 @@ int main(int argc, char* argv[]) {
             // P->gatherCIC();
 
             // kick
+            // oscillating E field to test independent particle motion
             IpplTimings::startTimer(PTimer);
-            P->P = P->P - 0.5 * dt * P->E;
+            // P->P = P->P - 0.5 * dt * P->E;
+            P->P = P->P - 0.5 * dt * std::sin(0.1 * P->time_m);
             IpplTimings::stopTimer(PTimer);
 
             P->time_m += dt;
@@ -258,7 +262,7 @@ int main(int argc, char* argv[]) {
             }
 
             // Uncomment to store particle density VTK files
-            // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
+            dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
         }
 
         msg << "Independent Particles Test: End." << endl;
