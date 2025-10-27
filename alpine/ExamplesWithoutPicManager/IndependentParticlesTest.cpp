@@ -229,7 +229,7 @@ int main(int argc, char* argv[]) {
 
             // scatter the charge onto the underlying grid
             // remove particle particle interaction
-            // P->scatterCIC(totalP, it + 1, hr);
+            P->scatterCIC(totalP, it + 1, hr);
 
             // Field solve
             IpplTimings::startTimer(SolveTimer);
