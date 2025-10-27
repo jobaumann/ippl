@@ -14,6 +14,7 @@
 //                values are 1.0, 2.0. Value 1.0 means no over-allocation.
 //     Example:
 //     srun ./IndependentParticlesTest 128 128 128 10000 10 FFT 10 --overallocate 1.0 --info 10
+//     ./IndependentParticlesTest 32 32 32 10 100 FFT 10 --overallocate 1.0 --info 10
 //
 #include <Kokkos_Random.hpp>
 #include <chrono>
@@ -194,19 +195,19 @@ int main(int argc, char* argv[]) {
             // all the particles hence eliminating the need to store mass as
             // an attribute
             // kick
-            // oscillating E field to test independent particle motion
+            // Linear E field to test independent particle motion
             IpplTimings::startTimer(PTimer);
             // P->P = P->P - 0.5 * dt * P->E;
-            P->P = P->P - 0.5 * dt * std::sin(0.1 * P->time_m);
+            P->P = P->P - 0.5 * dt * 0.01 * P->R;
             IpplTimings::stopTimer(PTimer);
 
-            // What does this do?
+            // thermostat on momenta
             IpplTimings::startTimer(temp);
-            Kokkos::parallel_for(
-                P->getLocalNum(),
-                generate_random<Vector_t<double, Dim>, Kokkos::Random_XorShift64_Pool<>, Dim>(
-                    P->P.getView(), rand_pool64, -hr, hr));
-            Kokkos::fence();
+            // Kokkos::parallel_for(
+            //     P->getLocalNum(),
+            //     generate_random<Vector_t<double, Dim>, Kokkos::Random_XorShift64_Pool<>, Dim>(
+            //         P->P.getView(), rand_pool64, -hr, hr));
+            // Kokkos::fence();
             IpplTimings::stopTimer(temp);
 
             // drift
@@ -230,7 +231,10 @@ int main(int argc, char* argv[]) {
             // scatter the charge onto the underlying grid
             // remove particle particle interaction
             P->scatterCIC(totalP, it + 1, hr);
-
+            
+            // Uncomment to store particle density VTK files
+            dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
+            
             // Field solve
             IpplTimings::startTimer(SolveTimer);
             // remove particle particle interaction
@@ -245,7 +249,7 @@ int main(int argc, char* argv[]) {
             // oscillating E field to test independent particle motion
             IpplTimings::startTimer(PTimer);
             // P->P = P->P - 0.5 * dt * P->E;
-            P->P = P->P - 0.5 * dt * std::sin(0.1 * P->time_m);
+            P->P = P->P - 0.5 * dt * 0.01 * P->R;
             IpplTimings::stopTimer(PTimer);
 
             P->time_m += dt;
@@ -261,8 +265,6 @@ int main(int argc, char* argv[]) {
                 break;
             }
 
-            // Uncomment to store particle density VTK files
-            dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
         }
 
         msg << "Independent Particles Test: End." << endl;

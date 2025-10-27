@@ -198,7 +198,6 @@ int main(int argc, char* argv[]) {
             P->P = P->P - 0.5 * dt * P->E;
             IpplTimings::stopTimer(PTimer);
 
-            // What does this do?
             IpplTimings::startTimer(temp);
             Kokkos::parallel_for(
                 P->getLocalNum(),
