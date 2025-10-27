@@ -1,6 +1,6 @@
-// Uniform Plasma Test
+// Independent Particles Test
 //   Usage:
-//     srun ./UniformPlasmaTest
+//     srun ./IndependentParticlesTest
 //                  <nx> [<ny>...] <Np> <Nt> <stype>
 //                  <lbthres> --overallocate <ovfactor> --info 10
 //     nx       = No. cell-centered points in the x-direction
@@ -13,7 +13,7 @@
 //     ovfactor = Over-allocation factor for the buffers used in the communication. Typical
 //                values are 1.0, 2.0. Value 1.0 means no over-allocation.
 //     Example:
-//     srun ./UniformPlasmaTest 128 128 128 10000 10 FFT 10 --overallocate 1.0 --info 10
+//     srun ./IndependentParticlesTest 128 128 128 10000 10 FFT 10 --overallocate 1.0 --info 10
 //
 #include <Kokkos_Random.hpp>
 #include <chrono>
@@ -29,7 +29,7 @@
 
 constexpr unsigned Dim = 3;
 
-const char* TestName = "UniformPlasmaTest";
+const char* TestName = "IndependentParticlesTest";
 
 template <typename T, class GeneratorPool, unsigned Dim>
 struct generate_random {
@@ -68,7 +68,7 @@ int main(int argc, char* argv[]) {
     {
         setSignalHandler();
 
-        Inform msg("UniformPlasmaTest");
+        Inform msg("IndependentParticlesTest");
         Inform msg2all(argv[0], INFORM_ALL_NODES);
 
         auto start = std::chrono::high_resolution_clock::now();
@@ -94,7 +94,7 @@ int main(int argc, char* argv[]) {
         const size_type totalP = std::atoll(argv[arg++]);
         const unsigned int nt  = std::atoi(argv[arg++]);
 
-        msg << "Uniform Plasma Test" << endl
+        msg << "Independent Particles Test" << endl
             << "nt " << nt << " Np= " << totalP << " grid = " << nr << endl;
 
         using bunch_type = ChargedParticles<PLayout_t<double, Dim>, double, Dim>;
@@ -226,15 +226,18 @@ int main(int argc, char* argv[]) {
             }
 
             // scatter the charge onto the underlying grid
-            P->scatterCIC(totalP, it + 1, hr);
+            // remove particle particle interaction
+            // P->scatterCIC(totalP, it + 1, hr);
 
             // Field solve
             IpplTimings::startTimer(SolveTimer);
-            P->runSolver();
+            // remove particle particle interaction
+            // P->runSolver();
             IpplTimings::stopTimer(SolveTimer);
 
             // gather E field
-            P->gatherCIC();
+            // remove particle particle interaction
+            // P->gatherCIC();
 
             // kick
             IpplTimings::startTimer(PTimer);
@@ -258,7 +261,7 @@ int main(int argc, char* argv[]) {
             // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
         }
 
-        msg << "Uniform Plasma Test: End." << endl;
+        msg << "Independent Particles Test: End." << endl;
         IpplTimings::stopTimer(mainTimer);
         IpplTimings::print();
         IpplTimings::print(std::string("timing.dat"));
