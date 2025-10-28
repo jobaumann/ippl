@@ -207,17 +207,16 @@ int main(int argc, char* argv[]) {
             // Constant magnetic field to test independent particle motion
             double B = 0.001; // magnetic field strength in z direction
             IpplTimings::startTimer(PTimer);
-            auto& Pview = P->P.getView();
-            auto& Qview = P->q.getView();
+            auto Pview = P->P.getView();
+            auto Qview = P->q.getView();
             Kokkos::parallel_for(
                 P->getLocalNum(), 
-                [=](const size_type i) {
+                KOKKOS_LAMBDA(const size_type i) {
                     Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
                     Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
                 }
             );
             Kokkos::fence();
-
             IpplTimings::stopTimer(PTimer);
 
             // thermostat on momenta
@@ -269,7 +268,7 @@ int main(int argc, char* argv[]) {
             IpplTimings::startTimer(PTimer);
             Kokkos::parallel_for(
                 P->getLocalNum(), 
-                [=](const size_type i) {
+                KOKKOS_LAMBDA(const size_type i) {
                     Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
                     Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
                 }
