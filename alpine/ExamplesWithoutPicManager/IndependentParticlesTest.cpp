@@ -123,6 +123,7 @@ int main(int argc, char* argv[]) {
         FieldLayout_t<Dim> FL(MPI_COMM_WORLD, domain, isParallel, isAllPeriodic);
         PLayout_t<double, Dim> PL(FL, mesh);
 
+        // Why this specific number?
         double Q           = -1562.5;
         std::string solver = argv[arg++];
         P = std::make_unique<bunch_type>(PL, hr, rmin, rmax, isParallel, Q, solver);
@@ -151,7 +152,15 @@ int main(int argc, char* argv[]) {
                       P->R.getView(), rand_pool64, Rmin, Rmax));
         Kokkos::fence();
         P->q = P->Q_m / totalP;
-        P->P = 0.0;
+
+        // Initialize random particle velocities
+        // P->P = 0.0;
+        Kokkos::parallel_for(
+            nloc, generate_random<Vector_t<double, Dim>, Kokkos::Random_XorShift64_Pool<>, Dim>(
+                      P->P.getView(), rand_pool64, -1, 1));
+        Kokkos::fence();
+
+
         IpplTimings::stopTimer(particleCreation);
 
         P->initializeFields(mesh, FL);
@@ -195,10 +204,20 @@ int main(int argc, char* argv[]) {
             // all the particles hence eliminating the need to store mass as
             // an attribute
             // kick
-            // Linear E field to test independent particle motion
+            // Constant magnetic field to test independent particle motion
+            double B = 0.001; // magnetic field strength in z direction
             IpplTimings::startTimer(PTimer);
-            // P->P = P->P - 0.5 * dt * P->E;
-            P->P = P->P - 0.5 * dt * 0.01 * P->R;
+            auto& Pview = P->P.getView();
+            auto& Qview = P->q.getView();
+            Kokkos::parallel_for(
+                P->getLocalNum(), 
+                [=](const size_type i) {
+                    Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                    Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                }
+            );
+            Kokkos::fence();
+
             IpplTimings::stopTimer(PTimer);
 
             // thermostat on momenta
@@ -246,10 +265,16 @@ int main(int argc, char* argv[]) {
             // P->gatherCIC();
 
             // kick
-            // oscillating E field to test independent particle motion
+            // Rotational E field to test independent particle motion
             IpplTimings::startTimer(PTimer);
-            // P->P = P->P - 0.5 * dt * P->E;
-            P->P = P->P - 0.5 * dt * 0.01 * P->R;
+            Kokkos::parallel_for(
+                P->getLocalNum(), 
+                [=](const size_type i) {
+                    Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                    Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                }
+            );
+            Kokkos::fence();
             IpplTimings::stopTimer(PTimer);
 
             P->time_m += dt;
