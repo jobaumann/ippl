@@ -105,6 +105,8 @@ function(set_kokkos_options)
 
   if("CUDA" IN_LIST IPPL_PLATFORMS)
     set(Kokkos_ENABLE_CUDA_LAMBDA ON)
+    # Allow newer GCC versions with CUDA (GCC 13+ with CUDA that officially supports up to GCC 12)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --allow-unsupported-compiler" CACHE STRING "CUDA compiler flags" FORCE)
   endif()
 
   if("HIP" IN_LIST IPPL_PLATFORMS)
