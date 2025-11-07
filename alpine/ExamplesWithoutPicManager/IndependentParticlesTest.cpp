@@ -203,12 +203,16 @@ int main(int argc, char* argv[]) {
             // Here, we assume a constant charge-to-mass ratio of -1 for
             // all the particles hence eliminating the need to store mass as
             // an attribute
+
+            // get views for particle attributes
+            auto Pview = P->P.getView();
+            auto Qview = P->q.getView();
+            auto Rview = P->R.getView();
+
             // kick
             // Constant magnetic field to test independent particle motion
             double B = 0.001; // magnetic field strength in z direction
             IpplTimings::startTimer(PTimer);
-            auto Pview = P->P.getView();
-            auto Qview = P->q.getView();
             Kokkos::parallel_for(
                 P->getLocalNum(), 
                 KOKKOS_LAMBDA(const size_type i) {
@@ -231,6 +235,15 @@ int main(int argc, char* argv[]) {
             // drift
             IpplTimings::startTimer(RTimer);
             P->R = P->R + dt * P->P;
+            Kokkos::parallel_for(
+                P->getLocalNum(), 
+                KOKKOS_LAMBDA(const size_type i) {
+                    Rview(i)[0] += dt * Pview(i)[0];
+                    Rview(i)[1] += dt * Pview(i)[1];
+                    Rview(i)[2] += dt * Pview(i)[2];
+                }
+            );
+            Kokkos::fence();
             IpplTimings::stopTimer(RTimer);
 
             // Since the particles have moved spatially update them to correct processors
@@ -250,14 +263,14 @@ int main(int argc, char* argv[]) {
             // remove particle particle interaction
             P->scatterCIC(totalP, it + 1, hr);
             
-            // Uncomment to store particle density VTK files
-            dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
-            
             // Field solve
             IpplTimings::startTimer(SolveTimer);
             // remove particle particle interaction
             // P->runSolver();
             IpplTimings::stopTimer(SolveTimer);
+            
+            // Uncomment to store particle density VTK files
+            // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
 
             // gather E field
             // remove particle particle interaction
