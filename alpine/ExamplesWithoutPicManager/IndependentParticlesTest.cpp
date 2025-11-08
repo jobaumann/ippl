@@ -200,109 +200,99 @@ int main(int argc, char* argv[]) {
         auto Qview = P->q.getView();
         auto Rview = P->R.getView();
 
+        double B = 0.001; // magnetic field strength in z direction
+        
         // begin main timestep loop
         msg << "Starting iterations ..." << endl;
         // P->gatherStatistics(totalP);
-        for (unsigned int it = 0; it < nt; it++) {
-            // LeapFrog time stepping https://en.wikipedia.org/wiki/Leapfrog_integration
-            // Here, we assume a constant charge-to-mass ratio of -1 for
-            // all the particles hence eliminating the need to store mass as
-            // an attribute
 
-            // kick
-            // Constant magnetic field to test independent particle motion
-            double B = 0.001; // magnetic field strength in z direction
-            IpplTimings::startTimer(PTimer);
-            Kokkos::parallel_for(
-                P->getLocalNum(), 
-                KOKKOS_LAMBDA(const size_type i) {
+        Kokkos::parallel_for(
+            P->getLocalNum(), 
+            KOKKOS_LAMBDA(const size_type i) {
+                for (unsigned int it = 0; it < nt; it++) {
+                    // LeapFrog time stepping https://en.wikipedia.org/wiki/Leapfrog_integration
+                    // Here, we assume a constant charge-to-mass ratio of -1 for
+                    // all the particles hence eliminating the need to store mass as
+                    // an attribute
+
+                    // kick
+                    // Constant magnetic field to test independent particle motion
+                    // IpplTimings::startTimer(PTimer);
                     Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
                     Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
-                }
-            );
-            Kokkos::fence();
-            IpplTimings::stopTimer(PTimer);
+                    // IpplTimings::stopTimer(PTimer);
 
-            // thermostat on momenta
-            IpplTimings::startTimer(temp);
-            // Kokkos::parallel_for(
-            //     P->getLocalNum(),
-            //     generate_random<Vector_t<double, Dim>, Kokkos::Random_XorShift64_Pool<>, Dim>(
-            //         P->P.getView(), rand_pool64, -hr, hr));
-            // Kokkos::fence();
-            IpplTimings::stopTimer(temp);
+                    // thermostat on momenta
+                    // IpplTimings::startTimer(temp);
+                    // Kokkos::parallel_for(
+                    //     P->getLocalNum(),
+                    //     generate_random<Vector_t<double, Dim>, Kokkos::Random_XorShift64_Pool<>, Dim>(
+                    //         P->P.getView(), rand_pool64, -hr, hr));
+                    // Kokkos::fence();
+                    // IpplTimings::stopTimer(temp);
 
-            // drift
-            IpplTimings::startTimer(RTimer);
-            P->R = P->R + dt * P->P;
-            Kokkos::parallel_for(
-                P->getLocalNum(), 
-                KOKKOS_LAMBDA(const size_type i) {
+                    // drift
+                    // IpplTimings::startTimer(RTimer);
                     Rview(i)[0] += dt * Pview(i)[0];
                     Rview(i)[1] += dt * Pview(i)[1];
                     Rview(i)[2] += dt * Pview(i)[2];
-                }
-            );
-            Kokkos::fence();
-            IpplTimings::stopTimer(RTimer);
+                    // IpplTimings::stopTimer(RTimer);
 
-            // Since the particles have moved spatially update them to correct processors
-            IpplTimings::startTimer(updateTimer);
-            P->update();
-            IpplTimings::stopTimer(updateTimer);
+                    // Since the particles have moved spatially update them to correct processors
+                    // IpplTimings::startTimer(updateTimer);
+                    // P->update();
+                    // IpplTimings::stopTimer(updateTimer);
 
-            // Domain Decomposition
-            if (P->balance(totalP, it + 1)) {
-                msg << "Starting repartition" << endl;
-                IpplTimings::startTimer(domainDecomposition);
-                P->repartition(FL, mesh, fromAnalyticDensity);
-                IpplTimings::stopTimer(domainDecomposition);
-            }
+                    // Domain Decomposition
+                    // if (P->balance(totalP, it + 1)) {
+                    //     msg << "Starting repartition" << endl;
+                    //     IpplTimings::startTimer(domainDecomposition);
+                    //     P->repartition(FL, mesh, fromAnalyticDensity);
+                    //     IpplTimings::stopTimer(domainDecomposition);
+                    // }
 
-            // scatter the charge onto the underlying grid
-            // remove particle particle interaction
-            // P->scatterCIC(totalP, it + 1, hr);
-            
-            // Field solve
-            IpplTimings::startTimer(SolveTimer);
-            // remove particle particle interaction
-            // P->runSolver();
-            IpplTimings::stopTimer(SolveTimer);
-            
-            // Uncomment to store particle density VTK files
-            // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
+                    // scatter the charge onto the underlying grid
+                    // remove particle particle interaction
+                    // P->scatterCIC(totalP, it + 1, hr);
+                    
+                    // Field solve
+                    // IpplTimings::startTimer(SolveTimer);
+                    // remove particle particle interaction
+                    // P->runSolver();
+                    // IpplTimings::stopTimer(SolveTimer);
+                    
+                    // Uncomment to store particle density VTK files
+                    // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
 
-            // gather E field
-            // remove particle particle interaction
-            // P->gatherCIC();
+                    // gather E field
+                    // remove particle particle interaction
+                    // P->gatherCIC();
 
-            // kick
-            // Rotational E field to test independent particle motion
-            IpplTimings::startTimer(PTimer);
-            Kokkos::parallel_for(
-                P->getLocalNum(), 
-                KOKKOS_LAMBDA(const size_type i) {
+                    // kick
+                    // Rotational E field to test independent particle motion
+                    // IpplTimings::startTimer(PTimer);
                     Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
                     Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                    // IpplTimings::stopTimer(PTimer);
+
+                    // P->time_m += dt;
+                    // IpplTimings::startTimer(dumpDataTimer);
+                    // P->dumpData();
+                    // P->gatherStatistics(totalP);
+                    // IpplTimings::stopTimer(dumpDataTimer);
+                    // msg << "Finished time step: " << it + 1 << " time: " << P->time_m << endl;
+
+                    // if (checkSignalHandler()) {
+                    //     msg << "Aborting timestepping loop due to signal " << interruptSignalReceived
+                    //         << endl;
+                    //     break;
+                    // }
+
                 }
-            );
-            Kokkos::fence();
-            IpplTimings::stopTimer(PTimer);
-
-            P->time_m += dt;
-            IpplTimings::startTimer(dumpDataTimer);
-            P->dumpData();
-            P->gatherStatistics(totalP);
-            IpplTimings::stopTimer(dumpDataTimer);
-            msg << "Finished time step: " << it + 1 << " time: " << P->time_m << endl;
-
-            if (checkSignalHandler()) {
-                msg << "Aborting timestepping loop due to signal " << interruptSignalReceived
-                    << endl;
-                break;
             }
+        );
 
-        }
+        P->dumpData();
 
         msg << "Independent Particles Test: End." << endl;
         IpplTimings::stopTimer(mainTimer);
