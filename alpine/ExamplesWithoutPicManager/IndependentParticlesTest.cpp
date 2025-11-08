@@ -195,6 +195,11 @@ int main(int argc, char* argv[]) {
         P->gatherStatistics(totalP);
         IpplTimings::stopTimer(dumpDataTimer);
 
+        // get views for particle attributes
+        auto Pview = P->P.getView();
+        auto Qview = P->q.getView();
+        auto Rview = P->R.getView();
+
         // begin main timestep loop
         msg << "Starting iterations ..." << endl;
         // P->gatherStatistics(totalP);
@@ -203,11 +208,6 @@ int main(int argc, char* argv[]) {
             // Here, we assume a constant charge-to-mass ratio of -1 for
             // all the particles hence eliminating the need to store mass as
             // an attribute
-
-            // get views for particle attributes
-            auto Pview = P->P.getView();
-            auto Qview = P->q.getView();
-            auto Rview = P->R.getView();
 
             // kick
             // Constant magnetic field to test independent particle motion
@@ -261,7 +261,7 @@ int main(int argc, char* argv[]) {
 
             // scatter the charge onto the underlying grid
             // remove particle particle interaction
-            P->scatterCIC(totalP, it + 1, hr);
+            // P->scatterCIC(totalP, it + 1, hr);
             
             // Field solve
             IpplTimings::startTimer(SolveTimer);
