@@ -210,8 +210,8 @@ int main(int argc, char* argv[]) {
 
         // Set checkpoint frequency for intermediate output (0 = no intermediate output)
         // For intermediate VTK files and statistics, set this to a positive value
-        const unsigned int checkpointFreq = 0;  // Set to 0 for pure task-parallel (fastest)
-                                                  // Set to >0 for intermediate output every N steps
+        const unsigned int checkpointFreq = 1;  // Set to 0 for pure task-parallel (fastest)
+                                                 // Set to >0 for intermediate output every N steps
 
         static IpplTimings::TimerRef taskParallelTimer = IpplTimings::getTimer("taskParallelLoop");
         IpplTimings::startTimer(taskParallelTimer);
@@ -276,13 +276,26 @@ int main(int argc, char* argv[]) {
                 );
                 Kokkos::fence();
 
+                // Since the particles have moved spatially update them to correct processors
+                IpplTimings::startTimer(updateTimer);
+                P->update();
+                IpplTimings::stopTimer(updateTimer);
+
+                // Domain Decomposition
+                if (P->balance(totalP, chunk_end)) {
+                    msg << "Starting repartition" << endl;
+                    IpplTimings::startTimer(domainDecomposition);
+                    P->repartition(FL, mesh, fromAnalyticDensity);
+                    IpplTimings::stopTimer(domainDecomposition);
+                }
+
                 // Intermediate output at checkpoint
                 P->time_m = chunk_end * dt;
                 P->scatterCIC(totalP, chunk_end, hr);
 
                 // Uncomment to enable intermediate VTK files:
-                // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], chunk_end,
-                //         P->hr_m[0], P->hr_m[1], P->hr_m[2]);
+                dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], chunk_end,
+                        P->hr_m[0], P->hr_m[1], P->hr_m[2]);
 
                 P->dumpData();
                 P->gatherStatistics(totalP);
