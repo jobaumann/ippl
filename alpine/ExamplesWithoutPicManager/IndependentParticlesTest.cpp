@@ -210,7 +210,7 @@ int main(int argc, char* argv[]) {
 
         // Set checkpoint frequency for intermediate output (0 = no intermediate output)
         // For intermediate VTK files and statistics, set this to a positive value
-        const unsigned int checkpointFreq = 1;  // Set to 0 for pure task-parallel (fastest)
+        const unsigned int checkpointFreq = 0;  // Set to 0 for pure task-parallel (fastest)
                                                  // Set to >0 for intermediate output every N steps
 
         static IpplTimings::TimerRef taskParallelTimer = IpplTimings::getTimer("taskParallelLoop");
