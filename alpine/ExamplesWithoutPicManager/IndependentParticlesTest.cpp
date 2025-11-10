@@ -201,98 +201,126 @@ int main(int argc, char* argv[]) {
         auto Rview = P->R.getView();
 
         double B = 0.001; // magnetic field strength in z direction
-        
+
         // begin main timestep loop
         msg << "Starting iterations ..." << endl;
-        // P->gatherStatistics(totalP);
 
-        Kokkos::parallel_for(
-            P->getLocalNum(), 
-            KOKKOS_LAMBDA(const size_type i) {
-                for (unsigned int it = 0; it < nt; it++) {
-                    // LeapFrog time stepping https://en.wikipedia.org/wiki/Leapfrog_integration
-                    // Here, we assume a constant charge-to-mass ratio of -1 for
-                    // all the particles hence eliminating the need to store mass as
-                    // an attribute
+        // Task-parallel approach: Each particle executes all timesteps independently
+        // NOTE: This approach only works for independent particles (no field solve, no boundary crossing)
 
-                    // kick
-                    // Constant magnetic field to test independent particle motion
-                    // IpplTimings::startTimer(PTimer);
-                    Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                    Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
-                    // IpplTimings::stopTimer(PTimer);
+        // Set checkpoint frequency for intermediate output (0 = no intermediate output)
+        // For intermediate VTK files and statistics, set this to a positive value
+        const unsigned int checkpointFreq = 0;  // Set to 0 for pure task-parallel (fastest)
+                                                  // Set to >0 for intermediate output every N steps
 
-                    // thermostat on momenta
-                    // IpplTimings::startTimer(temp);
-                    // Kokkos::parallel_for(
-                    //     P->getLocalNum(),
-                    //     generate_random<Vector_t<double, Dim>, Kokkos::Random_XorShift64_Pool<>, Dim>(
-                    //         P->P.getView(), rand_pool64, -hr, hr));
-                    // Kokkos::fence();
-                    // IpplTimings::stopTimer(temp);
+        static IpplTimings::TimerRef taskParallelTimer = IpplTimings::getTimer("taskParallelLoop");
+        IpplTimings::startTimer(taskParallelTimer);
 
-                    // drift
-                    // IpplTimings::startTimer(RTimer);
-                    Rview(i)[0] += dt * Pview(i)[0];
-                    Rview(i)[1] += dt * Pview(i)[1];
-                    Rview(i)[2] += dt * Pview(i)[2];
-                    // IpplTimings::stopTimer(RTimer);
+        if (checkpointFreq == 0) {
+            // Pure task-parallel: Run all timesteps in one kernel (fastest)
+            Kokkos::parallel_for(
+                "IndependentParticleLoop",
+                P->getLocalNum(),
+                KOKKOS_LAMBDA(const size_type i) {
+                    // Each particle independently executes all timesteps
+                    for (unsigned int it = 0; it < nt; it++) {
+                        // LeapFrog time stepping https://en.wikipedia.org/wiki/Leapfrog_integration
+                        // Here, we assume a constant charge-to-mass ratio of -1 for
+                        // all the particles hence eliminating the need to store mass as
+                        // an attribute
 
-                    // Since the particles have moved spatially update them to correct processors
-                    // IpplTimings::startTimer(updateTimer);
-                    // P->update();
-                    // IpplTimings::stopTimer(updateTimer);
+                        // kick (first half of velocity update)
+                        // Constant magnetic field to test independent particle motion
+                        Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                        Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
 
-                    // Domain Decomposition
-                    // if (P->balance(totalP, it + 1)) {
-                    //     msg << "Starting repartition" << endl;
-                    //     IpplTimings::startTimer(domainDecomposition);
-                    //     P->repartition(FL, mesh, fromAnalyticDensity);
-                    //     IpplTimings::stopTimer(domainDecomposition);
-                    // }
+                        // drift (position update)
+                        Rview(i)[0] += dt * Pview(i)[0];
+                        Rview(i)[1] += dt * Pview(i)[1];
+                        Rview(i)[2] += dt * Pview(i)[2];
 
-                    // scatter the charge onto the underlying grid
-                    // remove particle particle interaction
-                    // P->scatterCIC(totalP, it + 1, hr);
-                    
-                    // Field solve
-                    // IpplTimings::startTimer(SolveTimer);
-                    // remove particle particle interaction
-                    // P->runSolver();
-                    // IpplTimings::stopTimer(SolveTimer);
-                    
-                    // Uncomment to store particle density VTK files
-                    // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
-
-                    // gather E field
-                    // remove particle particle interaction
-                    // P->gatherCIC();
-
-                    // kick
-                    // Rotational E field to test independent particle motion
-                    // IpplTimings::startTimer(PTimer);
-                    Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                    Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
-                    // IpplTimings::stopTimer(PTimer);
-
-                    // P->time_m += dt;
-                    // IpplTimings::startTimer(dumpDataTimer);
-                    // P->dumpData();
-                    // P->gatherStatistics(totalP);
-                    // IpplTimings::stopTimer(dumpDataTimer);
-                    // msg << "Finished time step: " << it + 1 << " time: " << P->time_m << endl;
-
-                    // if (checkSignalHandler()) {
-                    //     msg << "Aborting timestepping loop due to signal " << interruptSignalReceived
-                    //         << endl;
-                    //     break;
-                    // }
-
+                        // kick (second half of velocity update)
+                        Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                        Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                    }
                 }
-            }
-        );
+            );
+            Kokkos::fence();
+        } else {
+            // Hybrid approach: Break into chunks for intermediate output
+            msg << "Using hybrid task-parallel with checkpoints every " << checkpointFreq << " steps" << endl;
+            for (unsigned int chunk_start = 0; chunk_start < nt; chunk_start += checkpointFreq) {
+                unsigned int chunk_end = std::min(chunk_start + checkpointFreq, nt);
+                unsigned int chunk_size = chunk_end - chunk_start;
 
+                // Run task-parallel chunk
+                Kokkos::parallel_for(
+                    "IndependentParticleChunk",
+                    P->getLocalNum(),
+                    KOKKOS_LAMBDA(const size_type i) {
+                        for (unsigned int it = 0; it < chunk_size; it++) {
+                            // kick
+                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+
+                            // drift
+                            Rview(i)[0] += dt * Pview(i)[0];
+                            Rview(i)[1] += dt * Pview(i)[1];
+                            Rview(i)[2] += dt * Pview(i)[2];
+
+                            // kick
+                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                        }
+                    }
+                );
+                Kokkos::fence();
+
+                // Intermediate output at checkpoint
+                P->time_m = chunk_end * dt;
+                P->scatterCIC(totalP, chunk_end, hr);
+
+                // Uncomment to enable intermediate VTK files:
+                // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], chunk_end,
+                //         P->hr_m[0], P->hr_m[1], P->hr_m[2]);
+
+                P->dumpData();
+                P->gatherStatistics(totalP);
+
+                msg << "Checkpoint: completed timestep " << chunk_end << " / " << nt << endl;
+            }
+        }
+
+        IpplTimings::stopTimer(taskParallelTimer);
+
+        // Update final simulation time
+        P->time_m = nt * dt;
+
+        msg << "Task-parallel loop completed. All particles advanced " << nt << " timesteps." << endl;
+
+        // Final output
+        // Note: For pure performance testing, we skip detailed output
+        // Uncomment below for full diagnostics (requires particle update first)
+
+        /*
+        // Update particles to correct MPI ranks after movement
+        IpplTimings::startTimer(updateTimer);
+        P->update();
+        IpplTimings::stopTimer(updateTimer);
+
+        IpplTimings::startTimer(dumpDataTimer);
+        P->scatterCIC(totalP, nt, hr);
+
+        // Optional: Generate final VTK file for visualization
+        // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], nt, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
+
+        // Dump final statistics
         P->dumpData();
+        P->gatherStatistics(totalP);
+        IpplTimings::stopTimer(dumpDataTimer);
+        */
+
+        msg << "Skipping detailed final output for performance test" << endl;
 
         msg << "Independent Particles Test: End." << endl;
         IpplTimings::stopTimer(mainTimer);
