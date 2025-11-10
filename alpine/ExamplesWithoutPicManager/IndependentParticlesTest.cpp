@@ -224,13 +224,13 @@ int main(int argc, char* argv[]) {
             IpplTimings::stopTimer(PTimer);
 
             // thermostat on momenta
-            IpplTimings::startTimer(temp);
+            // IpplTimings::startTimer(temp);
             // Kokkos::parallel_for(
             //     P->getLocalNum(),
             //     generate_random<Vector_t<double, Dim>, Kokkos::Random_XorShift64_Pool<>, Dim>(
             //         P->P.getView(), rand_pool64, -hr, hr));
             // Kokkos::fence();
-            IpplTimings::stopTimer(temp);
+            // IpplTimings::stopTimer(temp);
 
             // drift
             IpplTimings::startTimer(RTimer);
@@ -247,27 +247,27 @@ int main(int argc, char* argv[]) {
             IpplTimings::stopTimer(RTimer);
 
             // Since the particles have moved spatially update them to correct processors
-            IpplTimings::startTimer(updateTimer);
-            P->update();
-            IpplTimings::stopTimer(updateTimer);
+            // IpplTimings::startTimer(updateTimer);
+            // P->update();
+            // IpplTimings::stopTimer(updateTimer);
 
             // Domain Decomposition
-            if (P->balance(totalP, it + 1)) {
-                msg << "Starting repartition" << endl;
-                IpplTimings::startTimer(domainDecomposition);
-                P->repartition(FL, mesh, fromAnalyticDensity);
-                IpplTimings::stopTimer(domainDecomposition);
-            }
+            // if (P->balance(totalP, it + 1)) {
+            //     msg << "Starting repartition" << endl;
+            //     IpplTimings::startTimer(domainDecomposition);
+            //     P->repartition(FL, mesh, fromAnalyticDensity);
+            //     IpplTimings::stopTimer(domainDecomposition);
+            // }
 
             // scatter the charge onto the underlying grid
             // remove particle particle interaction
             // P->scatterCIC(totalP, it + 1, hr);
             
             // Field solve
-            IpplTimings::startTimer(SolveTimer);
+            // IpplTimings::startTimer(SolveTimer);
             // remove particle particle interaction
             // P->runSolver();
-            IpplTimings::stopTimer(SolveTimer);
+            // IpplTimings::stopTimer(SolveTimer);
             
             // Uncomment to store particle density VTK files
             // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], it, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
@@ -289,12 +289,12 @@ int main(int argc, char* argv[]) {
             Kokkos::fence();
             IpplTimings::stopTimer(PTimer);
 
-            P->time_m += dt;
-            IpplTimings::startTimer(dumpDataTimer);
-            P->dumpData();
-            P->gatherStatistics(totalP);
-            IpplTimings::stopTimer(dumpDataTimer);
-            msg << "Finished time step: " << it + 1 << " time: " << P->time_m << endl;
+            // P->time_m += dt;
+            // IpplTimings::startTimer(dumpDataTimer);
+            // P->dumpData();
+            // P->gatherStatistics(totalP);
+            // IpplTimings::stopTimer(dumpDataTimer);
+            // msg << "Finished time step: " << it + 1 << " time: " << P->time_m << endl;
 
             if (checkSignalHandler()) {
                 msg << "Aborting timestepping loop due to signal " << interruptSignalReceived
