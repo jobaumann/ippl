@@ -276,19 +276,6 @@ int main(int argc, char* argv[]) {
                 );
                 Kokkos::fence();
 
-                // Since the particles have moved spatially update them to correct processors
-                IpplTimings::startTimer(updateTimer);
-                P->update();
-                IpplTimings::stopTimer(updateTimer);
-
-                // Domain Decomposition
-                if (P->balance(totalP, chunk_end)) {
-                    msg << "Starting repartition" << endl;
-                    IpplTimings::startTimer(domainDecomposition);
-                    P->repartition(FL, mesh, fromAnalyticDensity);
-                    IpplTimings::stopTimer(domainDecomposition);
-                }
-
                 // Intermediate output at checkpoint
                 P->time_m = chunk_end * dt;
                 P->scatterCIC(totalP, chunk_end, hr);

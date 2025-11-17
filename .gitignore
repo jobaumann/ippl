@@ -16,6 +16,11 @@ build*/
 # ignore build directories
 build*/
 
+# ignore benchmark output files
+benchmark_results*/
+benchmark_scaling*/
+timing.dat
+
 # ignore .vscode directory
 .vscode
 .cache
