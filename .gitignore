@@ -20,6 +20,10 @@ build*/
 benchmark*/
 timing.dat
 
+# benchmark scripts moved to ippl-benchmarks repository
+benchmark_*.sh
+plot_*.py
+
 # ignore .vscode directory
 .vscode
 .cache
