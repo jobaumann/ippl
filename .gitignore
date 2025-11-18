@@ -17,8 +17,7 @@ build*/
 build*/
 
 # ignore benchmark output files
-benchmark_results*/
-benchmark_scaling*/
+benchmark*/
 timing.dat
 
 # ignore .vscode directory
