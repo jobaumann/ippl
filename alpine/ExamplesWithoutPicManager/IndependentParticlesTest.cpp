@@ -253,7 +253,10 @@ int main(int argc, char* argv[]) {
         // Create random pool for birth/death (reuse the one from initialization with different seed)
         Kokkos::Random_XorShift64_Pool<> rand_pool_bd((size_type)(1337 + 100 * ippl::Comm->rank()));
 
-        if (checkpointFreq == 0) {
+        // Toggle between data-parallel and task-parallel approaches
+        const bool use_task_parallelism = true;  // Set to true to use task parallelism
+
+        if (checkpointFreq == 0 && !use_task_parallelism) {
             // Pure task-parallel: Run all timesteps in one kernel (fastest)
             Kokkos::parallel_for(
                 "IndependentParticleLoop",
@@ -313,6 +316,134 @@ int main(int argc, char* argv[]) {
                 }
             );
             Kokkos::fence();
+        } else if (checkpointFreq == 0 && use_task_parallelism) {
+            // Task-parallel approach: Dynamic load balancing for heterogeneous particle lifetimes
+            msg << "Using Kokkos task parallelism for dynamic load balancing" << endl;
+
+            using ExecSpace = Kokkos::DefaultExecutionSpace;
+            using MemorySpace = typename ExecSpace::memory_space;
+            using TaskScheduler = Kokkos::TaskScheduler<ExecSpace>;
+            using TaskPolicy = Kokkos::TaskTeam<ExecSpace>;
+
+            // Chunk size: how many timesteps per task
+            const unsigned int task_chunk_size = 10;  // Tune this based on problem
+
+            // Create task scheduler with memory pool
+            // Pool size should be: num_particles * max_tasks_per_particle * task_memory
+            size_t pool_size = P->getLocalNum() * (nt / task_chunk_size + 1) * 1024;
+            TaskScheduler scheduler(MemorySpace(), pool_size);
+
+            // Functor for particle timestep task
+            struct ParticleTask {
+                // Particle data
+                typename decltype(Pview)::const_type Pview;
+                typename decltype(Qview)::const_type Qview;
+                typename decltype(Rview)::const_type Rview;
+
+                // Simulation parameters
+                size_type particle_id;
+                unsigned int start_timestep;
+                unsigned int end_timestep;
+                unsigned int total_timesteps;
+                double dt;
+                double B;
+                double death_chance;
+                double birth_chance;
+                double active_charge;
+                Vector_t<double, Dim> birth_rmin;
+                Vector_t<double, Dim> birth_rmax;
+                unsigned int task_chunk_size;
+
+                // Random pool
+                Kokkos::Random_XorShift64_Pool<> rand_pool;
+
+                // Task scheduler for spawning follow-up tasks
+                TaskScheduler scheduler;
+
+                KOKKOS_FUNCTION
+                void operator()(typename TaskPolicy::member_type& member) {
+                    // Get random number generator
+                    auto rand_gen = rand_pool.get_state();
+
+                    // Process this chunk of timesteps
+                    for (unsigned int it = start_timestep; it < end_timestep; ++it) {
+                        bool is_active = (Qview(particle_id) != 0.0);
+
+                        if (is_active) {
+                            // Active particle: run physics (LeapFrog)
+                            // kick (first half)
+                            Pview(particle_id)[0] += 0.5 * dt * B * Qview(particle_id) * Pview(particle_id)[1];
+                            Pview(particle_id)[1] -= 0.5 * dt * B * Qview(particle_id) * Pview(particle_id)[0];
+
+                            // drift
+                            Rview(particle_id)[0] += dt * Pview(particle_id)[0];
+                            Rview(particle_id)[1] += dt * Pview(particle_id)[1];
+                            Rview(particle_id)[2] += dt * Pview(particle_id)[2];
+
+                            // kick (second half)
+                            Pview(particle_id)[0] += 0.5 * dt * B * Qview(particle_id) * Pview(particle_id)[1];
+                            Pview(particle_id)[1] -= 0.5 * dt * B * Qview(particle_id) * Pview(particle_id)[0];
+
+                            // Death check
+                            double rand_val = rand_gen.drand(0.0, 1.0);
+                            if (rand_val < death_chance) {
+                                Qview(particle_id) = 0.0;  // Particle died, stop processing
+                            }
+                        } else {
+                            // Dormant particle: check for birth
+                            double rand_val = rand_gen.drand(0.0, 1.0);
+                            if (rand_val < birth_chance) {
+                                // Birth: activate dormant particle
+                                Qview(particle_id) = active_charge;
+
+                                // Initialize new particle
+                                for (unsigned d = 0; d < Dim; ++d) {
+                                    Rview(particle_id)[d] = rand_gen.drand(birth_rmin[d], birth_rmax[d]);
+                                    Pview(particle_id)[d] = rand_gen.drand(-1.0, 1.0);
+                                }
+                            }
+                        }
+                    }
+
+                    rand_pool.free_state(rand_gen);
+
+                    // Spawn follow-up task if more timesteps remain
+                    if (end_timestep < total_timesteps) {
+                        ParticleTask next_task = *this;  // Copy current task
+                        next_task.start_timestep = end_timestep;
+                        next_task.end_timestep = std::min(end_timestep + task_chunk_size, total_timesteps);
+
+                        // Spawn the next chunk as a new task
+                        Kokkos::task_spawn(Kokkos::TaskTeam(scheduler), next_task);
+                    }
+                }
+            };
+
+            // Spawn initial tasks for all particles
+            Kokkos::parallel_for(
+                "Spawn particle tasks",
+                Kokkos::RangePolicy<ExecSpace>(0, P->getLocalNum()),
+                KOKKOS_LAMBDA(const size_type i) {
+                    ParticleTask initial_task{
+                        Pview, Qview, Rview,
+                        i,  // particle_id
+                        0,  // start_timestep
+                        std::min(task_chunk_size, nt),  // end_timestep
+                        nt,  // total_timesteps
+                        dt, B, death_chance, birth_chance,
+                        active_charge, birth_rmin, birth_rmax,
+                        task_chunk_size,
+                        rand_pool_bd,
+                        scheduler
+                    };
+
+                    Kokkos::task_spawn(Kokkos::TaskTeam(scheduler), initial_task);
+                });
+
+            // Wait for all tasks to complete
+            Kokkos::wait(scheduler);
+
+            msg << "Task-parallel execution completed" << endl;
         } else {
             // Hybrid approach: Break into chunks for intermediate output
             msg << "Using hybrid task-parallel with checkpoints every " << checkpointFreq << " steps" << endl;
