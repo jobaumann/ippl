@@ -218,8 +218,8 @@ int main(int argc, char* argv[]) {
         msg << "Starting iterations ..." << endl;
 
         // 3-Stage Time-Blocking approach with Birth/Death and Load Balancing
-        // Stage 1: Simulate existing particles, track births/deaths
-        // Stage 2: Catch up newly born particles to end of time block
+        // Stage 1: Simulate existing particles, track deaths and count births needed
+        // Stage 2: Destroy dead particles, create new particles, catch up new particles
         // Stage 3: Load balance alive particles across ranks
 
         const unsigned int time_block_size = 20;  // Number of timesteps per time block
@@ -227,20 +227,20 @@ int main(int argc, char* argv[]) {
 
         static IpplTimings::TimerRef timeBlockTimer = IpplTimings::getTimer("timeBlockLoop");
         static IpplTimings::TimerRef stage1Timer = IpplTimings::getTimer("stage1Simulation");
-        static IpplTimings::TimerRef stage2Timer = IpplTimings::getTimer("stage2CatchUp");
+        static IpplTimings::TimerRef stage2Timer = IpplTimings::getTimer("stage2BirthDeath");
         static IpplTimings::TimerRef stage3Timer = IpplTimings::getTimer("stage3LoadBalance");
 
         IpplTimings::startTimer(timeBlockTimer);
 
-        double death_chance = 0.0001;  // Probability per timestep for active particle to die
-        double birth_chance = 0.0001;  // Probability per timestep for dormant particle to be born
+        double death_chance = 0.0001;  // Probability per timestep for particle to die
+        double birth_chance = 0.0001;  // Probability per timestep per particle for birth
 
         // Variables needed for birth (captured by lambda)
         const double active_charge = P->Q_m / totalP;
         const Vector_t<double, Dim> birth_rmin = rmin;
         const Vector_t<double, Dim> birth_rmax = rmax;
 
-        // Create random pool for birth/death (reuse the one from initialization with different seed)
+        // Create random pool for birth/death
         Kokkos::Random_XorShift64_Pool<> rand_pool_bd((size_type)(1337 + 100 * ippl::Comm->rank()));
 
         // Time block loop
@@ -253,20 +253,25 @@ int main(int argc, char* argv[]) {
                 << " (timesteps " << block_start << "-" << block_end << ")" << endl;
 
             // =================================================================
-            // STAGE 1: Simulate existing particles, track births and deaths
+            // STAGE 1: Simulate existing particles, track deaths and births
             // =================================================================
             IpplTimings::startTimer(stage1Timer);
 
             size_type current_local_num = P->getLocalNum();
 
-            // Tracking structures for births and deaths
-            using bool_type = Kokkos::View<int*>;
-            bool_type died_mask("died_particles", current_local_num);
-            bool_type birth_mask("birth_requests", current_local_num);
+            // Get fresh views (may have changed from previous block)
+            Pview = P->P.getView();
+            Qview = P->q.getView();
+            Rview = P->R.getView();
 
-            // Track birth times for each dormant particle that requests birth
+            // Tracking structures
+            using bool_type = Kokkos::View<bool*>;
+            bool_type died_mask("died_particles", current_local_num);
+
+            // Count births per particle (each particle can trigger 0 or 1 birth per block)
             using uint_type = Kokkos::View<unsigned int*>;
             uint_type birth_times("birth_times", current_local_num);
+            bool_type birth_requested("birth_requested", current_local_num);
 
             // Stage 1: Simulate and track
             Kokkos::parallel_for(
@@ -275,12 +280,11 @@ int main(int argc, char* argv[]) {
                 KOKKOS_LAMBDA(const size_type i) {
                     auto rand_gen = rand_pool_bd.get_state();
 
-                    bool is_active = (Qview(i) != 0.0);
                     bool has_died = false;
 
                     // Simulate for this time block
                     for (unsigned int step = 0; step < block_steps; ++step) {
-                        if (is_active && !has_died) {
+                        if (!has_died) {
                             // Active particle: run physics (LeapFrog)
                             // kick (first half)
                             Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
@@ -298,19 +302,19 @@ int main(int argc, char* argv[]) {
                             // Death check
                             double rand_val = rand_gen.drand(0.0, 1.0);
                             if (rand_val < death_chance) {
-                                died_mask(i) = 1;
+                                died_mask(i) = true;
                                 has_died = true;
                             }
-                        } else if (!is_active && !has_died) {
-                            // Dormant particle: check for birth (once per time block)
-                            if (step == 0) {  // Check only at start of block
-                                double rand_val = rand_gen.drand(0.0, 1.0);
-                                if (rand_val < birth_chance) {
-                                    birth_mask(i) = 1;
-                                    // Random birth time within this block
-                                    birth_times(i) = static_cast<unsigned int>(
-                                        rand_gen.drand(0.0, static_cast<double>(block_steps)));
-                                }
+                        }
+
+                        // Each particle can request a birth once per block
+                        if (step == 0) {
+                            double rand_val = rand_gen.drand(0.0, 1.0);
+                            if (rand_val < birth_chance) {
+                                birth_requested(i) = true;
+                                // Random birth time within this block
+                                birth_times(i) = static_cast<unsigned int>(
+                                    rand_gen.drand(0.0, static_cast<double>(block_steps)));
                             }
                         }
                     }
@@ -319,106 +323,126 @@ int main(int argc, char* argv[]) {
                 });
             Kokkos::fence();
 
-            // Count births and deaths
+            // Count deaths and birth requests
             size_type num_died = 0;
             size_type num_births = 0;
 
             Kokkos::parallel_reduce("Count deaths", current_local_num,
                 KOKKOS_LAMBDA(const size_type i, size_type& sum) {
-                    if (died_mask(i) == 1) sum += 1;
+                    if (died_mask(i)) sum += 1;
                 }, num_died);
 
             Kokkos::parallel_reduce("Count births", current_local_num,
                 KOKKOS_LAMBDA(const size_type i, size_type& sum) {
-                    if (birth_mask(i) == 1) sum += 1;
+                    if (birth_requested(i)) sum += 1;
                 }, num_births);
 
             IpplTimings::stopTimer(stage1Timer);
 
             msg << "  Stage 1: Simulated " << current_local_num << " particles, "
-                << num_died << " deaths, " << num_births << " births" << endl;
+                << num_died << " deaths, " << num_births << " birth requests" << endl;
 
             // =================================================================
-            // STAGE 2: Catch up newly born particles to end of time block
+            // STAGE 2: Destroy dead particles, create new, catch up new particles
             // =================================================================
             IpplTimings::startTimer(stage2Timer);
 
+            // Destroy dead particles
+            if (num_died > 0) {
+                P->destroy(died_mask, num_died);
+                msg << "  Stage 2a: Destroyed " << num_died << " particles" << endl;
+            }
+
+            // Store birth times before creating (need to extract from old indices)
+            using birth_info_type = Kokkos::View<unsigned int*>;
+            birth_info_type stored_birth_times("stored_birth_times", num_births);
+
             if (num_births > 0) {
-                // Simulate birth-requested particles from their birth time to end of block
-                Kokkos::parallel_for(
-                    "Stage2_CatchUpBirths",
-                    current_local_num,
-                    KOKKOS_LAMBDA(const size_type i) {
-                        if (birth_mask(i) == 1) {
-                            auto rand_gen = rand_pool_bd.get_state();
-
-                            // Initialize particle at random position
-                            for (unsigned d = 0; d < Dim; ++d) {
-                                Rview(i)[d] = rand_gen.drand(birth_rmin[d], birth_rmax[d]);
-                                Pview(i)[d] = rand_gen.drand(-1.0, 1.0);
+                // Extract birth times for particles that requested birth
+                size_type birth_idx = 0;
+                Kokkos::parallel_scan("Extract birth times", current_local_num,
+                    KOKKOS_LAMBDA(const size_type i, size_type& idx, const bool final) {
+                        if (birth_requested(i)) {
+                            if (final) {
+                                stored_birth_times(idx) = birth_times(i);
                             }
-
-                            // Activate particle
-                            Qview(i) = active_charge;
-
-                            // Simulate from birth time to end of block (no more births/deaths)
-                            unsigned int birth_time = birth_times(i);
-                            for (unsigned int step = birth_time; step < block_steps; ++step) {
-                                // LeapFrog integration
-                                // kick (first half)
-                                Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                                Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
-
-                                // drift
-                                Rview(i)[0] += dt * Pview(i)[0];
-                                Rview(i)[1] += dt * Pview(i)[1];
-                                Rview(i)[2] += dt * Pview(i)[2];
-
-                                // kick (second half)
-                                Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                                Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
-                            }
-
-                            rand_pool_bd.free_state(rand_gen);
+                            idx += 1;
                         }
+                    }, birth_idx);
+                Kokkos::fence();
+
+                // Create new particles
+                size_type old_local_num = P->getLocalNum();
+                P->create(num_births);
+
+                msg << "  Stage 2b: Created " << num_births << " new particles" << endl;
+
+                // Get updated views after creation
+                Pview = P->P.getView();
+                Qview = P->q.getView();
+                Rview = P->R.getView();
+                size_type new_local_num = P->getLocalNum();
+
+                // Initialize and catch up newly created particles
+                // New particles are at indices [old_local_num, new_local_num)
+                Kokkos::parallel_for(
+                    "Stage2_InitializeAndCatchUp",
+                    Kokkos::RangePolicy<>(old_local_num, new_local_num),
+                    KOKKOS_LAMBDA(const size_type i) {
+                        auto rand_gen = rand_pool_bd.get_state();
+
+                        size_type birth_info_idx = i - old_local_num;
+
+                        // Initialize particle at random position and velocity
+                        for (unsigned d = 0; d < Dim; ++d) {
+                            Rview(i)[d] = rand_gen.drand(birth_rmin[d], birth_rmax[d]);
+                            Pview(i)[d] = rand_gen.drand(-1.0, 1.0);
+                        }
+
+                        // Set charge
+                        Qview(i) = active_charge;
+
+                        // Catch up: simulate from birth time to end of block
+                        unsigned int birth_time = stored_birth_times(birth_info_idx);
+                        for (unsigned int step = birth_time; step < block_steps; ++step) {
+                            // LeapFrog integration (no births/deaths during catch-up)
+                            // kick (first half)
+                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+
+                            // drift
+                            Rview(i)[0] += dt * Pview(i)[0];
+                            Rview(i)[1] += dt * Pview(i)[1];
+                            Rview(i)[2] += dt * Pview(i)[2];
+
+                            // kick (second half)
+                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                        }
+
+                        rand_pool_bd.free_state(rand_gen);
                     });
                 Kokkos::fence();
+
+                msg << "  Stage 2c: Caught up " << num_births << " new particles" << endl;
             }
 
             IpplTimings::stopTimer(stage2Timer);
 
-            msg << "  Stage 2: Caught up " << num_births << " newly born particles" << endl;
-
             // =================================================================
-            // STAGE 3: Load balance and clean up dead particles
+            // STAGE 3: Load balance particles across ranks
             // =================================================================
             IpplTimings::startTimer(stage3Timer);
-
-            // Mark dead particles with q = 0 for cleanup
-            if (num_died > 0) {
-                Kokkos::parallel_for("Mark dead particles", current_local_num,
-                    KOKKOS_LAMBDA(const size_type i) {
-                        if (died_mask(i) == 1) {
-                            Qview(i) = 0.0;  // Mark as dead/dormant
-                        }
-                    });
-                Kokkos::fence();
-            }
 
             // TODO: Implement tree-based load balancing here
             // For now, just update particle positions across ranks
             P->update();
 
-            IpplTimings::stopTimer(stage3Timer);
-
-            size_type alive_count = 0;
-            Kokkos::parallel_reduce("Count alive", P->getLocalNum(),
-                KOKKOS_LAMBDA(const size_type i, size_type& sum) {
-                    if (Qview(i) != 0.0) sum += 1;
-                }, alive_count);
-
             size_type global_alive = 0;
-            ippl::Comm->reduce(alive_count, global_alive, 1, std::plus<size_type>());
+            size_type local_alive = P->getLocalNum();
+            ippl::Comm->reduce(local_alive, global_alive, 1, std::plus<size_type>());
+
+            IpplTimings::stopTimer(stage3Timer);
 
             if (ippl::Comm->rank() == 0) {
                 msg << "  Stage 3: Load balanced, " << global_alive << " particles alive globally" << endl;
