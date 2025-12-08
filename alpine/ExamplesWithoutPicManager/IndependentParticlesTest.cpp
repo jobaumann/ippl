@@ -216,6 +216,8 @@ int main(int argc, char* argv[]) {
         static IpplTimings::TimerRef taskParallelTimer = IpplTimings::getTimer("taskParallelLoop");
         IpplTimings::startTimer(taskParallelTimer);
 
+        double death_chance = 0.0001;
+
         if (checkpointFreq == 0) {
             // Pure task-parallel: Run all timesteps in one kernel (fastest)
             Kokkos::parallel_for(
@@ -242,6 +244,17 @@ int main(int argc, char* argv[]) {
                         // kick (second half of velocity update)
                         Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
                         Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+
+                        // TODO: Birth
+
+                        // random particle death for more complex workload balancing
+                        // TODO: Read task parallel doc of kokkos
+                        // TODO: Use kokkos inline random number generator
+                        // double rand_val = ((double)rand()) / RAND_MAX;
+                        // if (rand_val < death_chance) {
+                        //     // remove particle by quitting the loop early
+                        //     break;
+                        // }
                     }
                 }
             );
