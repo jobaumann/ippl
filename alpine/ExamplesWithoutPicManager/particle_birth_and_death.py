@@ -4,9 +4,9 @@ plt.figure(figsize=(10, 6))
 
 n_steps = 1000
 # Probability that a particle births another particle at each step
-p_birth = 0.051
+p_birth = 0.0001
 # Probability that a particle dies at each step
-p_death = 0.05
+p_death = 0.0001
 
 for run in range(100):
     # Run simulation
