@@ -95,13 +95,8 @@ int main(int argc, char* argv[]) {
         const size_type totalP = std::atoll(argv[arg++]);
         const unsigned int nt  = std::atoi(argv[arg++]);
 
-        // over-allocation factor for birth/death - allocate 50% more particles
-        const double overalloc_factor = 1.5;
-        const size_type totalP_allocated = static_cast<size_type>(totalP * overalloc_factor);
-
         msg << "Independent Particles Test" << endl
-            << "nt " << nt << " Np= " << totalP << " (allocated: " << totalP_allocated << ")"
-            << " grid = " << nr << endl;
+            << "nt " << nt << " Np= " << totalP << " grid = " << nr << endl;
 
         using bunch_type = ChargedParticles<PLayout_t<double, Dim>, double, Dim>;
 
@@ -134,19 +129,12 @@ int main(int argc, char* argv[]) {
         P = std::make_unique<bunch_type>(PL, hr, rmin, rmax, isParallel, Q, solver);
 
         P->nr_m        = nr;
-        // Distribute allocated particles across ranks
-        size_type nloc = totalP_allocated / ippl::Comm->size();
+        size_type nloc = totalP / ippl::Comm->size();
 
-        int rest = (int)(totalP_allocated - nloc * ippl::Comm->size());
+        int rest = (int)(totalP - nloc * ippl::Comm->size());
 
         if (ippl::Comm->rank() < rest)
             ++nloc;
-
-        // Calculate how many should be initially active on this rank
-        size_type nloc_active = totalP / ippl::Comm->size();
-        int rest_active = (int)(totalP - nloc_active * ippl::Comm->size());
-        if (ippl::Comm->rank() < rest_active)
-            ++nloc_active;
 
         IpplTimings::startTimer(particleCreation);
         P->create(nloc);
@@ -165,26 +153,14 @@ int main(int argc, char* argv[]) {
                       P->R.getView(), rand_pool64, Rmin, Rmax));
         Kokkos::fence();
 
-        // Initialize velocities for all particles (active and dormant)
+        // Initialize velocities for all particles
         Kokkos::parallel_for(
             nloc, generate_random<Vector_t<double, Dim>, Kokkos::Random_XorShift64_Pool<>, Dim>(
                       P->P.getView(), rand_pool64, -1, 1));
         Kokkos::fence();
 
-        // Set charge: active particles get proper charge, dormant particles get q=0
-        {
-            auto Qview_init = P->q.getView();
-            const double active_charge_init = P->Q_m / totalP;
-            Kokkos::parallel_for(
-                nloc, KOKKOS_LAMBDA(const size_type i) {
-                    if (i < nloc_active) {
-                        Qview_init(i) = active_charge_init;  // Active particle
-                    } else {
-                        Qview_init(i) = 0.0;  // Dormant particle
-                    }
-                });
-            Kokkos::fence();
-        }
+        // Set charge for all particles
+        P->q = P->Q_m / totalP;
 
 
         IpplTimings::stopTimer(particleCreation);
@@ -201,12 +177,22 @@ int main(int argc, char* argv[]) {
         P->time_m            = 0.0;
         P->loadbalancefreq_m = std::atoi(argv[arg++]);
 
+        // Parse --overallocate parameter
+        double overalloc_factor = 1.0;  // Default: no over-allocation
+        if (arg < argc && std::string(argv[arg]) == "--overallocate") {
+            ++arg;
+            if (arg < argc) {
+                overalloc_factor = std::atof(argv[arg++]);
+            }
+        }
+        msg << "Over-allocation factor: " << overalloc_factor << endl;
+
         IpplTimings::startTimer(DummySolveTimer);
         P->rho_m = 0.0;
         P->runSolver();
         IpplTimings::stopTimer(DummySolveTimer);
 
-        P->scatterCIC(totalP_allocated, 0, hr);
+        P->scatterCIC(totalP, 0, hr);
         P->initializeORB(FL, mesh);
         // bool fromAnalyticDensity = false;
 
@@ -218,7 +204,7 @@ int main(int argc, char* argv[]) {
 
         IpplTimings::startTimer(dumpDataTimer);
         P->dumpData();
-        P->gatherStatistics(totalP_allocated);
+        P->gatherStatistics(totalP);
         IpplTimings::stopTimer(dumpDataTimer);
 
         // get views for particle attributes
