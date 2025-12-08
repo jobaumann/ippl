@@ -82,21 +82,26 @@ int main(int argc, char* argv[]) {
         static IpplTimings::TimerRef mainTimer        = IpplTimings::getTimer("total");
         static IpplTimings::TimerRef particleCreation = IpplTimings::getTimer("particlesCreation");
         static IpplTimings::TimerRef dumpDataTimer    = IpplTimings::getTimer("dumpData");
-        static IpplTimings::TimerRef PTimer           = IpplTimings::getTimer("pushVelocity");
-        static IpplTimings::TimerRef temp             = IpplTimings::getTimer("randomMove");
-        static IpplTimings::TimerRef RTimer           = IpplTimings::getTimer("pushPosition");
+        // static IpplTimings::TimerRef PTimer           = IpplTimings::getTimer("pushVelocity");
+        // static IpplTimings::TimerRef temp             = IpplTimings::getTimer("randomMove");
+        // static IpplTimings::TimerRef RTimer           = IpplTimings::getTimer("pushPosition");
         static IpplTimings::TimerRef updateTimer      = IpplTimings::getTimer("update");
         static IpplTimings::TimerRef DummySolveTimer  = IpplTimings::getTimer("solveWarmup");
         static IpplTimings::TimerRef SolveTimer       = IpplTimings::getTimer("solve");
-        static IpplTimings::TimerRef domainDecomposition = IpplTimings::getTimer("loadBalance");
+        // static IpplTimings::TimerRef domainDecomposition = IpplTimings::getTimer("loadBalance");
 
         IpplTimings::startTimer(mainTimer);
 
         const size_type totalP = std::atoll(argv[arg++]);
         const unsigned int nt  = std::atoi(argv[arg++]);
 
+        // over-allocation factor for birth/death - allocate 50% more particles
+        const double overalloc_factor = 1.5;
+        const size_type totalP_allocated = static_cast<size_type>(totalP * overalloc_factor);
+
         msg << "Independent Particles Test" << endl
-            << "nt " << nt << " Np= " << totalP << " grid = " << nr << endl;
+            << "nt " << nt << " Np= " << totalP << " (allocated: " << totalP_allocated << ")"
+            << " grid = " << nr << endl;
 
         using bunch_type = ChargedParticles<PLayout_t<double, Dim>, double, Dim>;
 
@@ -129,12 +134,19 @@ int main(int argc, char* argv[]) {
         P = std::make_unique<bunch_type>(PL, hr, rmin, rmax, isParallel, Q, solver);
 
         P->nr_m        = nr;
-        size_type nloc = totalP / ippl::Comm->size();
+        // Distribute allocated particles across ranks
+        size_type nloc = totalP_allocated / ippl::Comm->size();
 
-        int rest = (int)(totalP - nloc * ippl::Comm->size());
+        int rest = (int)(totalP_allocated - nloc * ippl::Comm->size());
 
         if (ippl::Comm->rank() < rest)
             ++nloc;
+
+        // Calculate how many should be initially active on this rank
+        size_type nloc_active = totalP / ippl::Comm->size();
+        int rest_active = (int)(totalP - nloc_active * ippl::Comm->size());
+        if (ippl::Comm->rank() < rest_active)
+            ++nloc_active;
 
         IpplTimings::startTimer(particleCreation);
         P->create(nloc);
@@ -147,18 +159,32 @@ int main(int argc, char* argv[]) {
         }
 
         Kokkos::Random_XorShift64_Pool<> rand_pool64((size_type)(42 + 100 * ippl::Comm->rank()));
+        // Initialize positions for all particles (active and dormant)
         Kokkos::parallel_for(
             nloc, generate_random<Vector_t<double, Dim>, Kokkos::Random_XorShift64_Pool<>, Dim>(
                       P->R.getView(), rand_pool64, Rmin, Rmax));
         Kokkos::fence();
-        P->q = P->Q_m / totalP;
 
-        // Initialize random particle velocities
-        // P->P = 0.0;
+        // Initialize velocities for all particles (active and dormant)
         Kokkos::parallel_for(
             nloc, generate_random<Vector_t<double, Dim>, Kokkos::Random_XorShift64_Pool<>, Dim>(
                       P->P.getView(), rand_pool64, -1, 1));
         Kokkos::fence();
+
+        // Set charge: active particles get proper charge, dormant particles get q=0
+        {
+            auto Qview_init = P->q.getView();
+            const double active_charge_init = P->Q_m / totalP;
+            Kokkos::parallel_for(
+                nloc, KOKKOS_LAMBDA(const size_type i) {
+                    if (i < nloc_active) {
+                        Qview_init(i) = active_charge_init;  // Active particle
+                    } else {
+                        Qview_init(i) = 0.0;  // Dormant particle
+                    }
+                });
+            Kokkos::fence();
+        }
 
 
         IpplTimings::stopTimer(particleCreation);
@@ -180,9 +206,9 @@ int main(int argc, char* argv[]) {
         P->runSolver();
         IpplTimings::stopTimer(DummySolveTimer);
 
-        P->scatterCIC(totalP, 0, hr);
+        P->scatterCIC(totalP_allocated, 0, hr);
         P->initializeORB(FL, mesh);
-        bool fromAnalyticDensity = false;
+        // bool fromAnalyticDensity = false;
 
         IpplTimings::startTimer(SolveTimer);
         P->runSolver();
@@ -192,7 +218,7 @@ int main(int argc, char* argv[]) {
 
         IpplTimings::startTimer(dumpDataTimer);
         P->dumpData();
-        P->gatherStatistics(totalP);
+        P->gatherStatistics(totalP_allocated);
         IpplTimings::stopTimer(dumpDataTimer);
 
         // get views for particle attributes
@@ -216,7 +242,16 @@ int main(int argc, char* argv[]) {
         static IpplTimings::TimerRef taskParallelTimer = IpplTimings::getTimer("taskParallelLoop");
         IpplTimings::startTimer(taskParallelTimer);
 
-        double death_chance = 0.0001;
+        double death_chance = 0.0001;  // Probability per timestep for active particle to die
+        double birth_chance = 0.0001;  // Probability per timestep for dormant particle to be born
+
+        // Variables needed for birth (captured by lambda)
+        const double active_charge = P->Q_m / totalP;
+        const Vector_t<double, Dim> birth_rmin = rmin;
+        const Vector_t<double, Dim> birth_rmax = rmax;
+
+        // Create random pool for birth/death (reuse the one from initialization with different seed)
+        Kokkos::Random_XorShift64_Pool<> rand_pool_bd((size_type)(1337 + 100 * ippl::Comm->rank()));
 
         if (checkpointFreq == 0) {
             // Pure task-parallel: Run all timesteps in one kernel (fastest)
@@ -224,38 +259,57 @@ int main(int argc, char* argv[]) {
                 "IndependentParticleLoop",
                 P->getLocalNum(),
                 KOKKOS_LAMBDA(const size_type i) {
+                    // Get random number generator state from pool for this particle
+                    auto rand_gen = rand_pool_bd.get_state();
+
                     // Each particle independently executes all timesteps
                     for (unsigned int it = 0; it < nt; it++) {
-                        // LeapFrog time stepping https://en.wikipedia.org/wiki/Leapfrog_integration
-                        // Here, we assume a constant charge-to-mass ratio of -1 for
-                        // all the particles hence eliminating the need to store mass as
-                        // an attribute
+                        bool is_active = (Qview(i) != 0.0);
 
-                        // kick (first half of velocity update)
-                        // Constant magnetic field to test independent particle motion
-                        Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                        Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                        if (is_active) {
+                            // Active particle: run physics
+                            // LeapFrog time stepping https://en.wikipedia.org/wiki/Leapfrog_integration
+                            // Here, we assume a constant charge-to-mass ratio of -1 for
+                            // all the particles hence eliminating the need to store mass as
+                            // an attribute
 
-                        // drift (position update)
-                        Rview(i)[0] += dt * Pview(i)[0];
-                        Rview(i)[1] += dt * Pview(i)[1];
-                        Rview(i)[2] += dt * Pview(i)[2];
+                            // kick (first half of velocity update)
+                            // Constant magnetic field to test independent particle motion
+                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
 
-                        // kick (second half of velocity update)
-                        Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                        Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                            // drift (position update)
+                            Rview(i)[0] += dt * Pview(i)[0];
+                            Rview(i)[1] += dt * Pview(i)[1];
+                            Rview(i)[2] += dt * Pview(i)[2];
 
-                        // TODO: Birth
+                            // kick (second half of velocity update)
+                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
 
-                        // random particle death for more complex workload balancing
-                        // TODO: Read task parallel doc of kokkos
-                        // TODO: Use kokkos inline random number generator
-                        // double rand_val = ((double)rand()) / RAND_MAX;
-                        // if (rand_val < death_chance) {
-                        //     // remove particle by quitting the loop early
-                        //     break;
-                        // }
+                            // Death check: random particle death for more complex workload balancing
+                            double rand_val = rand_gen.drand(0.0, 1.0);
+                            if (rand_val < death_chance) {
+                                Qview(i) = 0.0;  // Mark particle as dead (dormant)
+                            }
+                        } else {
+                            // Dormant particle: check for birth
+                            double rand_val = rand_gen.drand(0.0, 1.0);
+                            if (rand_val < birth_chance) {
+                                // Birth: activate dormant particle
+                                Qview(i) = active_charge;  // Set proper charge
+
+                                // Initialize new particle at random position in domain
+                                for (unsigned d = 0; d < Dim; ++d) {
+                                    Rview(i)[d] = rand_gen.drand(birth_rmin[d], birth_rmax[d]);
+                                    Pview(i)[d] = rand_gen.drand(-1.0, 1.0);
+                                }
+                            }
+                        }
                     }
+
+                    // Return the generator state to the pool
+                    rand_pool_bd.free_state(rand_gen);
                 }
             );
             Kokkos::fence();
@@ -271,34 +325,64 @@ int main(int argc, char* argv[]) {
                     "IndependentParticleChunk",
                     P->getLocalNum(),
                     KOKKOS_LAMBDA(const size_type i) {
+                        // Get random number generator state from pool for this particle
+                        auto rand_gen = rand_pool_bd.get_state();
+
                         for (unsigned int it = 0; it < chunk_size; it++) {
-                            // kick
-                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                            bool is_active = (Qview(i) != 0.0);
 
-                            // drift
-                            Rview(i)[0] += dt * Pview(i)[0];
-                            Rview(i)[1] += dt * Pview(i)[1];
-                            Rview(i)[2] += dt * Pview(i)[2];
+                            if (is_active) {
+                                // Active particle: run physics
+                                // kick
+                                Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                                Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
 
-                            // kick
-                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                                // drift
+                                Rview(i)[0] += dt * Pview(i)[0];
+                                Rview(i)[1] += dt * Pview(i)[1];
+                                Rview(i)[2] += dt * Pview(i)[2];
+
+                                // kick
+                                Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
+                                Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+
+                                // Death check
+                                double rand_val = rand_gen.drand(0.0, 1.0);
+                                if (rand_val < death_chance) {
+                                    Qview(i) = 0.0;  // Mark particle as dead
+                                }
+                            } else {
+                                // Dormant particle: check for birth
+                                double rand_val = rand_gen.drand(0.0, 1.0);
+                                if (rand_val < birth_chance) {
+                                    // Birth: activate dormant particle
+                                    Qview(i) = active_charge;
+
+                                    // Initialize new particle at random position
+                                    for (unsigned d = 0; d < Dim; ++d) {
+                                        Rview(i)[d] = rand_gen.drand(birth_rmin[d], birth_rmax[d]);
+                                        Pview(i)[d] = rand_gen.drand(-1.0, 1.0);
+                                    }
+                                }
+                            }
                         }
+
+                        // Return the generator state to the pool
+                        rand_pool_bd.free_state(rand_gen);
                     }
                 );
                 Kokkos::fence();
 
                 // Intermediate output at checkpoint
                 P->time_m = chunk_end * dt;
-                P->scatterCIC(totalP, chunk_end, hr);
+                P->scatterCIC(totalP_allocated, chunk_end, hr);
 
                 // Uncomment to enable intermediate VTK files:
                 dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], chunk_end,
                         P->hr_m[0], P->hr_m[1], P->hr_m[2]);
 
                 P->dumpData();
-                P->gatherStatistics(totalP);
+                P->gatherStatistics(totalP_allocated);
 
                 msg << "Checkpoint: completed timestep " << chunk_end << " / " << nt << endl;
             }
@@ -322,14 +406,14 @@ int main(int argc, char* argv[]) {
         IpplTimings::stopTimer(updateTimer);
 
         IpplTimings::startTimer(dumpDataTimer);
-        P->scatterCIC(totalP, nt, hr);
+        P->scatterCIC(totalP_allocated, nt, hr);
 
         // Optional: Generate final VTK file for visualization
         // dumpVTK(P->rho_m, P->nr_m[0], P->nr_m[1], P->nr_m[2], nt, P->hr_m[0], P->hr_m[1], P->hr_m[2]);
 
         // Dump final statistics
         P->dumpData();
-        P->gatherStatistics(totalP);
+        P->gatherStatistics(totalP_allocated);
         IpplTimings::stopTimer(dumpDataTimer);
         */
 
