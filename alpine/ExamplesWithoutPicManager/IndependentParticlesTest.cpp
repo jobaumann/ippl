@@ -208,8 +208,8 @@ int main(int argc, char* argv[]) {
 
         IpplTimings::startTimer(timeBlockTimer);
 
-        double death_chance = 0.0001;  // Probability per timestep for particle to die
-        double birth_chance = 0.0001;  // Probability per timestep per particle for birth
+        double death_chance = 0.001;  // Probability per timestep for particle to die
+        double birth_chance = 0.001;  // Probability per timestep per particle for birth
 
         // Variables needed for birth (captured by lambda)
         const double active_charge = P->Q_m / totalP;
@@ -286,13 +286,13 @@ int main(int argc, char* argv[]) {
                                 has_died = true;
                             }
                         }
+                    }
 
-                        // Each particle requests birth once per block (at step 0)
-                        if (step == 0 && rand_gen.drand(0.0, 1.0) < birth_chance) {
-                            birth_requested(i) = true;
-                            birth_times(i) = static_cast<unsigned int>(
-                                rand_gen.drand(0.0, static_cast<double>(block_steps)));
-                        }
+                    // Live particles can give birth (checked once per block, after simulation)
+                    if (!has_died && rand_gen.drand(0.0, 1.0) < birth_chance) {
+                        birth_requested(i) = true;
+                        birth_times(i) = static_cast<unsigned int>(
+                            rand_gen.drand(0.0, static_cast<double>(block_steps)));
                     }
 
                     rand_pool_bd.free_state(rand_gen);
