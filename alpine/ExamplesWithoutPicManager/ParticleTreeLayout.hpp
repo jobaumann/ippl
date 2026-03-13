@@ -418,6 +418,7 @@ private:
         }
     }
 
+public:
     template <class ParticleContainer>
     void fillHash(int nParticles, hash_type& hash, ParticleContainer& pc) {
         using policy_type = Kokkos::RangePolicy<position_execution_space>;
