@@ -57,8 +57,20 @@ int main(int argc, char* argv[]) {
         const unsigned int nt     = std::atoi(argv[arg++]);
         const unsigned int lbfreq = std::atoi(argv[arg++]);
 
+        // Check for --debug flag
+        bool debug = false;
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--debug") {
+                debug = true;
+                break;
+            }
+        }
+
         msg << "Independent Particles Test" << endl
             << "Np= " << totalP << " Nt= " << nt << " Load balance freq= " << lbfreq << endl;
+        if (debug) {
+            msg << "Debug mode: ENABLED" << endl;
+        }
 
         // Simulation parameters
         Vector_t<double, Dim> rmin(0.0);
@@ -70,17 +82,29 @@ int main(int argc, char* argv[]) {
         double death_chance = 0.001;  // Probability per timestep for particle to die
         double birth_chance = 0.001;  // Probability per timestep per particle for birth
 
-        // Create particle container with simple layout (tree-based layout needs debugging)
-        using PLayout_t = ippl::detail::ParticleLayout<double, Dim>;
-        using bunch_type = IndependentParticles<PLayout_t, double, Dim>;
-        PLayout_t PL;
+        // Create particle container with tree-based layout
+        using bunch_type = IndependentParticles<ParticleTreeLayout<double, Dim>, double, Dim>;
+        ParticleTreeLayout<double, Dim> PL(debug);
         std::unique_ptr<bunch_type> P = std::make_unique<bunch_type>(PL);
 
-        // Create particles distributed evenly across ranks
-        size_type nloc = totalP / ippl::Comm->size();
-        int rest       = (int)(totalP - nloc * ippl::Comm->size());
-        if (ippl::Comm->rank() < rest) {
-            ++nloc;
+        // Create particles with deliberate imbalance for testing
+        // Rank 0 gets 50% of particles, others share the rest
+        size_type nloc;
+        if (ippl::Comm->rank() == 0) {
+            nloc = totalP / 2;  // Rank 0 gets half
+        } else {
+            // Other ranks share the remaining half
+            size_type remaining = totalP - (totalP / 2);
+            nloc = remaining / (ippl::Comm->size() - 1);
+            int rest = remaining % (ippl::Comm->size() - 1);
+            if (ippl::Comm->rank() - 1 < rest) {
+                ++nloc;
+            }
+        }
+
+        if (debug) {
+            msg << "Rank " << ippl::Comm->rank() << " creating " << nloc
+                << " particles (imbalanced)" << endl;
         }
 
         // Timers
@@ -248,9 +272,8 @@ int main(int argc, char* argv[]) {
             IpplTimings::startTimer(stage2Timer);
 
             // 2a. Destroy dead particles
-            if (num_died > 0) {
-                P->destroy(died_mask, num_died);
-            }
+            // Always call destroy (even with 0) — it contains an allreduce
+            P->destroy(died_mask, num_died);
 
             // 2b. Extract birth times before creating new particles
             using birth_info_type = Kokkos::View<unsigned int*>;
@@ -267,8 +290,11 @@ int main(int argc, char* argv[]) {
                         if (birth_requested(i)) idx += 1;
                     });
                 Kokkos::fence();
+            }
 
-                // 2c. Create new particles
+            // 2c. Create new particles
+            // Always call create (even with 0) — it contains an allreduce
+            {
                 size_type old_local_num = P->getLocalNum();
                 P->create(num_births);
                 size_type new_local_num = P->getLocalNum();
@@ -325,25 +351,21 @@ int main(int argc, char* argv[]) {
                 << " created and caught up" << endl;
 
             // ============================================================
-            // STAGE 3: Load Balance
+            // STAGE 3: Tree-Based Load Balance
             // ============================================================
             IpplTimings::startTimer(stage3Timer);
 
-            // TODO: Implement load balancing
-            // P->update() hangs with multiple ranks (needs mesh/spatial info)
-            // Tree-based load balancing needs debugging (MPI deadlock)
-            // For now: skip load balancing to test birth/death with multiple ranks
+            P->getLayout().loadbalance(*P);
 
             IpplTimings::stopTimer(stage3Timer);
 
             // Report global particle count
             size_type global_alive = 0;
-            size_type local_alive  = P->getLocalNum();
+            size_type local_alive = P->getLocalNum();
             ippl::Comm->reduce(local_alive, global_alive, 1, std::plus<size_type>());
 
             if (ippl::Comm->rank() == 0) {
-                msg << "  Stage 3: " << global_alive
-                    << " particles globally after load balance" << endl;
+                msg << "  Stage 3: " << global_alive << " particles globally after load balance" << endl;
             }
         }
 

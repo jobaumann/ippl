@@ -239,12 +239,31 @@ public:
     using bool_type =
         typename ippl::detail::ViewType<bool, 1, position_memory_space>::view_type;
 
-    ParticleTreeLayout()
-        : ippl::detail::ParticleLayout<T, Dim, PositionProperties...>() {
+    ParticleTreeLayout(bool debug = false)
+        : ippl::detail::ParticleLayout<T, Dim, PositionProperties...>()
+        , debug_m(debug) {
         Tree commTree(ippl::Comm->size());
+
+        // Generate tree visualization if debug mode enabled
+        if (debug_m && ippl::Comm->rank() == 0) {
+            commTree.generateGraphvizOutput(commTree.getRoot(), "tree_structure.dot");
+        }
+
         parentRank_m    = commTree.getGlobalParent();
         childrenRanks_m = commTree.getGlobalChildren();
         numChildren_m   = commTree.getGlobalNumChildren();
+
+        // Print tree structure for each rank if debug enabled
+        if (debug_m) {
+            std::cout << "Rank " << ippl::Comm->rank() << ": parent=" << parentRank_m
+                      << ", numChildren=" << numChildren_m << ", children=[";
+            for (size_type i = 0; i < numChildren_m; ++i) {
+                std::cout << childrenRanks_m[i];
+                if (i < numChildren_m - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
     }
 
     template <class ParticleContainer>
@@ -319,9 +338,48 @@ private:
                       auto& childrenSubtreeWork, ParticleContainer& pc) {
         int tag = 0;
 
-        // Phase 1: All sends (non-blocking, so can post all sends first)
+        if (debug_m) {
+            std::cout << "Rank " << ippl::Comm->rank() << " exchangeWork: subtreeWork="
+                      << subtreeWork << ", subtreeQuota=" << subtreeQuota << std::endl;
+        }
+
+        // Use same ordering as reference implementation
+        // Receives happen first (blocking), then sends (non-blocking)
+        // This works because sendToRank is non-blocking in IPPL
+
+        if (subtreeWork < subtreeQuota && ippl::Comm->rank() != 0) {
+            size_t nRecvs = subtreeQuota - subtreeWork;
+            if (debug_m) {
+                std::cout << "Rank " << ippl::Comm->rank() << " receiving " << nRecvs
+                          << " particles from parent " << parentRank_m << std::endl;
+            }
+            pc.recvFromRank(parentRank_m, tag, nRecvs);
+            if (debug_m) {
+                std::cout << "Rank " << ippl::Comm->rank() << " received from parent" << std::endl;
+            }
+        }
+
+        for (size_type i = 0; i < numChildren_m; ++i) {
+            if (childrenSubtreeWork[i] > childrenSubtreeQuotas[i]) {
+                size_t nRecvs = childrenSubtreeWork[i] - childrenSubtreeQuotas[i];
+                if (debug_m) {
+                    std::cout << "Rank " << ippl::Comm->rank() << " receiving " << nRecvs
+                              << " particles from child " << childrenRanks_m[i] << std::endl;
+                }
+                pc.recvFromRank(childrenRanks_m[i], tag, nRecvs);
+                if (debug_m) {
+                    std::cout << "Rank " << ippl::Comm->rank() << " received from child "
+                              << childrenRanks_m[i] << std::endl;
+                }
+            }
+        }
+
         if (subtreeWork > subtreeQuota) {
             size_t numInvParticles = subtreeWork - subtreeQuota;
+            if (debug_m) {
+                std::cout << "Rank " << ippl::Comm->rank() << " sending " << numInvParticles
+                          << " particles to parent " << parentRank_m << std::endl;
+            }
             std::vector<MPI_Request> requests(0);
             hash_type hash("hash", numInvParticles);
             fillHash(numInvParticles, hash, pc);
@@ -329,11 +387,18 @@ private:
             bool_type invalidParticles("validity of particles", pc.getLocalNum());
             fillInvalid(numInvParticles, invalidParticles, pc);
             pc.internalDestroy(invalidParticles, numInvParticles);
+            if (debug_m) {
+                std::cout << "Rank " << ippl::Comm->rank() << " sent to parent" << std::endl;
+            }
         }
 
         for (size_type i = 0; i < numChildren_m; ++i) {
             if (childrenSubtreeWork[i] < childrenSubtreeQuotas[i]) {
                 size_t numInvParticles = childrenSubtreeQuotas[i] - childrenSubtreeWork[i];
+                if (debug_m) {
+                    std::cout << "Rank " << ippl::Comm->rank() << " sending " << numInvParticles
+                              << " particles to child " << childrenRanks_m[i] << std::endl;
+                }
                 std::vector<MPI_Request> requests(0);
                 hash_type hash("hash", numInvParticles);
                 fillHash(numInvParticles, hash, pc);
@@ -341,20 +406,15 @@ private:
                 bool_type invalidParticles("validity of particles", pc.getLocalNum());
                 fillInvalid(numInvParticles, invalidParticles, pc);
                 pc.internalDestroy(invalidParticles, numInvParticles);
+                if (debug_m) {
+                    std::cout << "Rank " << ippl::Comm->rank() << " sent to child "
+                              << childrenRanks_m[i] << std::endl;
+                }
             }
         }
 
-        // Phase 2: All receives (blocking, but senders have already posted)
-        if (subtreeWork < subtreeQuota && ippl::Comm->rank() != 0) {
-            size_t nRecvs = subtreeQuota - subtreeWork;
-            pc.recvFromRank(parentRank_m, tag, nRecvs);
-        }
-
-        for (size_type i = 0; i < numChildren_m; ++i) {
-            if (childrenSubtreeWork[i] > childrenSubtreeQuotas[i]) {
-                size_t nRecvs = childrenSubtreeWork[i] - childrenSubtreeQuotas[i];
-                pc.recvFromRank(childrenRanks_m[i], tag, nRecvs);
-            }
+        if (debug_m) {
+            std::cout << "Rank " << ippl::Comm->rank() << " exchangeWork: DONE" << std::endl;
         }
     }
 
@@ -381,6 +441,7 @@ private:
     size_type parentRank_m;
     std::array<size_type, 3> childrenRanks_m;
     size_type numChildren_m;
+    bool debug_m;
 };
 
 // ============================================================================
