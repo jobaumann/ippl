@@ -16,6 +16,7 @@ endfunction()
 # === Add individual examples ===
 add_alpine_example(UniformPlasmaTest)
 add_alpine_example(IndependentParticlesTest)
+add_alpine_example(TreeTest)
 add_alpine_example(LandauDampingMixedPrecision)
 add_alpine_example(LandauDampingParameterList)
 
