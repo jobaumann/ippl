@@ -96,7 +96,7 @@ int main(int argc, char* argv[]) {
         const unsigned int nt  = std::atoi(argv[arg++]);
 
         // over-allocation factor for birth/death - allocate 50% more particles
-        const double overalloc_factor = 1.5;
+        const double overalloc_factor = 1.0;
         const size_type totalP_allocated = static_cast<size_type>(totalP * overalloc_factor);
 
         msg << "Independent Particles Test" << endl
@@ -201,6 +201,18 @@ int main(int argc, char* argv[]) {
         P->time_m            = 0.0;
         P->loadbalancefreq_m = std::atoi(argv[arg++]);
 
+        // Optional: birth/death rates from CLI (default 0.0001)
+        double death_chance_param = 0.0001;
+        double birth_chance_param = 0.0001;
+        // Parse --overallocate first, then check for birth/death after --info
+        // Look for --death and --birth flags anywhere in argv
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--death" && i + 1 < argc)
+                death_chance_param = std::atof(argv[i + 1]);
+            if (std::string(argv[i]) == "--birth" && i + 1 < argc)
+                birth_chance_param = std::atof(argv[i + 1]);
+        }
+
         IpplTimings::startTimer(DummySolveTimer);
         P->rho_m = 0.0;
         P->runSolver();
@@ -227,6 +239,7 @@ int main(int argc, char* argv[]) {
         auto Rview = P->R.getView();
 
         double B = 0.001; // magnetic field strength in z direction
+        const double kick = 0.5 * dt * B * (P->Q_m / totalP);
 
         // begin main timestep loop
         msg << "Starting iterations ..." << endl;
@@ -242,8 +255,9 @@ int main(int argc, char* argv[]) {
         static IpplTimings::TimerRef taskParallelTimer = IpplTimings::getTimer("taskParallelLoop");
         IpplTimings::startTimer(taskParallelTimer);
 
-        double death_chance = 0.0001;  // Probability per timestep for active particle to die
-        double birth_chance = 0.0001;  // Probability per timestep for dormant particle to be born
+        double death_chance = death_chance_param;
+        double birth_chance = birth_chance_param;
+        msg << "death_chance= " << death_chance << " birth_chance= " << birth_chance << endl;
 
         // Variables needed for birth (captured by lambda)
         const double active_charge = P->Q_m / totalP;
@@ -253,51 +267,62 @@ int main(int argc, char* argv[]) {
         // Create random pool for birth/death (reuse the one from initialization with different seed)
         Kokkos::Random_XorShift64_Pool<> rand_pool_bd((size_type)(1337 + 100 * ippl::Comm->rank()));
 
-        if (checkpointFreq == 0) {
-            // Pure task-parallel: Run all timesteps in one kernel (fastest)
+        const bool has_birth_death = (death_chance > 0.0 || birth_chance > 0.0);
+
+        if (checkpointFreq == 0 && !has_birth_death) {
+            // Pure physics: no birth/death, no RNG overhead
+            Kokkos::parallel_for(
+                "IndependentParticleLoop_NoBD",
+                P->getLocalNum(),
+                KOKKOS_LAMBDA(const size_type i) {
+                    double vx = Pview(i)[0], vy = Pview(i)[1], vz = Pview(i)[2];
+                    double rx = Rview(i)[0], ry = Rview(i)[1], rz = Rview(i)[2];
+                    for (unsigned int it = 0; it < nt; it++) {
+                        vx += kick * vy;
+                        vy -= kick * vx;
+
+                        rx += dt * vx;
+                        ry += dt * vy;
+                        rz += dt * vz;
+
+                        vx += kick * vy;
+                        vy -= kick * vx;
+                    }
+                    Pview(i)[0] = vx; Pview(i)[1] = vy; Pview(i)[2] = vz;
+                    Rview(i)[0] = rx; Rview(i)[1] = ry; Rview(i)[2] = rz;
+                }
+            );
+            Kokkos::fence();
+        } else if (checkpointFreq == 0) {
+            // Pure task-parallel with birth/death
             Kokkos::parallel_for(
                 "IndependentParticleLoop",
                 P->getLocalNum(),
                 KOKKOS_LAMBDA(const size_type i) {
-                    // Get random number generator state from pool for this particle
                     auto rand_gen = rand_pool_bd.get_state();
 
-                    // Each particle independently executes all timesteps
                     for (unsigned int it = 0; it < nt; it++) {
                         bool is_active = (Qview(i) != 0.0);
 
                         if (is_active) {
-                            // Active particle: run physics
-                            // LeapFrog time stepping https://en.wikipedia.org/wiki/Leapfrog_integration
-                            // Here, we assume a constant charge-to-mass ratio of -1 for
-                            // all the particles hence eliminating the need to store mass as
-                            // an attribute
+                            Pview(i)[0] += kick * Pview(i)[1];
+                            Pview(i)[1] -= kick * Pview(i)[0];
 
-                            // kick (first half of velocity update)
-                            // Constant magnetic field to test independent particle motion
-                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
-
-                            // drift (position update)
                             Rview(i)[0] += dt * Pview(i)[0];
                             Rview(i)[1] += dt * Pview(i)[1];
                             Rview(i)[2] += dt * Pview(i)[2];
 
-                            // kick (second half of velocity update)
-                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                            Pview(i)[0] += kick * Pview(i)[1];
+                            Pview(i)[1] -= kick * Pview(i)[0];
 
-                            // Death check: random particle death for more complex workload balancing
                             double rand_val = rand_gen.drand(0.0, 1.0);
                             if (rand_val < death_chance) {
-                                Qview(i) = 0.0;  // Mark particle as dead (dormant)
+                                Qview(i) = 0.0;
                             }
                         } else {
-                            // Dormant particle: check for birth
                             double rand_val = rand_gen.drand(0.0, 1.0);
                             if (rand_val < birth_chance) {
-                                // Birth: activate dormant particle
-                                Qview(i) = active_charge;  // Set proper charge
+                                Qview(i) = active_charge;
 
                                 // Initialize new particle at random position in domain
                                 for (unsigned d = 0; d < Dim; ++d) {
@@ -334,8 +359,8 @@ int main(int argc, char* argv[]) {
                             if (is_active) {
                                 // Active particle: run physics
                                 // kick
-                                Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                                Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                                Pview(i)[0] += kick * Pview(i)[1];
+                                Pview(i)[1] -= kick * Pview(i)[0];
 
                                 // drift
                                 Rview(i)[0] += dt * Pview(i)[0];
@@ -343,8 +368,8 @@ int main(int argc, char* argv[]) {
                                 Rview(i)[2] += dt * Pview(i)[2];
 
                                 // kick
-                                Pview(i)[0] += 0.5 * dt * B * Qview(i) * Pview(i)[1];
-                                Pview(i)[1] -= 0.5 * dt * B * Qview(i) * Pview(i)[0];
+                                Pview(i)[0] += kick * Pview(i)[1];
+                                Pview(i)[1] -= kick * Pview(i)[0];
 
                                 // Death check
                                 double rand_val = rand_gen.drand(0.0, 1.0);
