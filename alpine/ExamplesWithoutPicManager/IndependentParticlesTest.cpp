@@ -57,6 +57,24 @@ int main(int argc, char* argv[]) {
         const unsigned int nt     = std::atoi(argv[arg++]);
         const unsigned int lbfreq = std::atoi(argv[arg++]);
 
+        // Optional positional: birth/death rates (default 0.001)
+        double death_chance = 0.001;
+        double birth_chance = 0.001;
+        if (arg < argc && argv[arg][0] != '-') {
+            death_chance = std::atof(argv[arg++]);
+        }
+        if (arg < argc && argv[arg][0] != '-') {
+            birth_chance = std::atof(argv[arg++]);
+        }
+
+        // Optional positional: LB imbalance threshold (default 0 = always LB)
+        // When > 0, LB is only triggered if max_local/avg_local > threshold.
+        // The check uses non-blocking MPI_Iallreduce overlapped with Stage 1.
+        double lb_threshold = 0.0;
+        if (arg < argc && argv[arg][0] != '-') {
+            lb_threshold = std::atof(argv[arg++]);
+        }
+
         // Check for --debug flag
         bool debug = false;
         for (int i = 1; i < argc; ++i) {
@@ -67,7 +85,9 @@ int main(int argc, char* argv[]) {
         }
 
         msg << "Independent Particles Test" << endl
-            << "Np= " << totalP << " Nt= " << nt << " Load balance freq= " << lbfreq << endl;
+            << "Np= " << totalP << " Nt= " << nt << " Load balance freq= " << lbfreq
+            << " death_chance= " << death_chance << " birth_chance= " << birth_chance
+            << " lb_threshold= " << lb_threshold << endl;
         if (debug) {
             msg << "Debug mode: ENABLED" << endl;
         }
@@ -76,35 +96,26 @@ int main(int argc, char* argv[]) {
         Vector_t<double, Dim> rmin(0.0);
         Vector_t<double, Dim> rmax(20.0);
         const double dt = 1.0;
-        const double B  = 0.001;  // Magnetic field strength in z direction
-        const double Q  = -1562.5;  // Total charge
-
-        double death_chance = 0.001;  // Probability per timestep for particle to die
-        double birth_chance = 0.001;  // Probability per timestep per particle for birth
+        const double B  = 0.001;       // Magnetic field strength in z direction
+        const double Q  = -1562.5;     // Total charge
+        const double charge_per_particle = Q / totalP;
+        const double kick = 0.5 * dt * B * charge_per_particle;  // Precomputed kick constant
 
         // Create particle container with tree-based layout
         using bunch_type = IndependentParticles<ParticleTreeLayout<double, Dim>, double, Dim>;
         ParticleTreeLayout<double, Dim> PL(debug);
         std::unique_ptr<bunch_type> P = std::make_unique<bunch_type>(PL);
 
-        // Create particles with deliberate imbalance for testing
-        // Rank 0 gets 50% of particles, others share the rest
-        size_type nloc;
-        if (ippl::Comm->rank() == 0) {
-            nloc = totalP / 2;  // Rank 0 gets half
-        } else {
-            // Other ranks share the remaining half
-            size_type remaining = totalP - (totalP / 2);
-            nloc = remaining / (ippl::Comm->size() - 1);
-            int rest = remaining % (ippl::Comm->size() - 1);
-            if (ippl::Comm->rank() - 1 < rest) {
-                ++nloc;
-            }
+        // Distribute particles evenly across ranks
+        size_type nloc = totalP / ippl::Comm->size();
+        int rest = totalP % ippl::Comm->size();
+        if (ippl::Comm->rank() < rest) {
+            ++nloc;
         }
 
         if (debug) {
             msg << "Rank " << ippl::Comm->rank() << " creating " << nloc
-                << " particles (imbalanced)" << endl;
+                << " particles" << endl;
         }
 
         // Timers
@@ -135,8 +146,7 @@ int main(int argc, char* argv[]) {
         Kokkos::fence();
 
         // Set charge for all particles
-        const double charge_per_particle = Q / totalP;
-        P->q                             = charge_per_particle;
+        P->q = charge_per_particle;
 
         IpplTimings::stopTimer(particleCreation);
 
@@ -164,6 +174,21 @@ int main(int argc, char* argv[]) {
 
         const unsigned int time_block_size = lbfreq;
         const unsigned int num_time_blocks = (nt + time_block_size - 1) / time_block_size;
+        const bool adaptive_lb = (lb_threshold > 0.0);
+
+        // Adaptive LB state: non-blocking allreduce for imbalance check
+        size_type lb_local_count = P->getLocalNum();
+        size_type lb_max_count = 0, lb_total_count = 0;
+        MPI_Request req_max = MPI_REQUEST_NULL, req_sum = MPI_REQUEST_NULL;
+        unsigned int lb_triggered = 0, lb_skipped = 0;
+
+        if (adaptive_lb) {
+            // Kick off initial imbalance check (completes during first block's Stage 1)
+            MPI_Iallreduce(&lb_local_count, &lb_max_count, 1, MPI_UNSIGNED_LONG_LONG,
+                           MPI_MAX, MPI_COMM_WORLD, &req_max);
+            MPI_Iallreduce(&lb_local_count, &lb_total_count, 1, MPI_UNSIGNED_LONG_LONG,
+                           MPI_SUM, MPI_COMM_WORLD, &req_sum);
+        }
 
         msg << "Starting iterations ..." << endl;
         IpplTimings::startTimer(timeBlockTimer);
@@ -188,7 +213,7 @@ int main(int argc, char* argv[]) {
             Qview = P->q.getView();
             Rview = P->R.getView();
 
-            // Tracking arrays for deaths and birth requests
+            // Simulate and track births/deaths
             using bool_type = Kokkos::View<bool*>;
             using uint_type = Kokkos::View<unsigned int*>;
 
@@ -196,48 +221,36 @@ int main(int argc, char* argv[]) {
             bool_type birth_requested("birth_requested", current_local_num);
             uint_type birth_times("birth_times", current_local_num);
 
-            // Simulate and track births/deaths
             Kokkos::parallel_for(
                 "Stage1_SimulateAndTrack", current_local_num,
                 KOKKOS_LAMBDA(const size_type i) {
                     auto rand_gen = rand_pool_bd.get_state();
                     bool has_died = false;
+                    double vx = Pview(i)[0], vy = Pview(i)[1], vz = Pview(i)[2];
+                    double rx = Rview(i)[0], ry = Rview(i)[1], rz = Rview(i)[2];
 
-                    // Simulate particle for this time block
                     for (unsigned int step = 0; step < block_steps; ++step) {
                         if (!has_died) {
-                            // LeapFrog integration with Lorentz force: F = q(v × B)
-                            double vx = Pview(i)[0];
-                            double vy = Pview(i)[1];
+                            vx += kick * vy;
+                            vy -= kick * vx;
+                            rx += dt * vx;
+                            ry += dt * vy;
+                            rz += dt * vz;
+                            vx += kick * vy;
+                            vy -= kick * vx;
 
-                            // Half-step velocity update (kick)
-                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * vy;
-                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * vx;
-
-                            // Full-step position update (drift)
-                            Rview(i)[0] += dt * Pview(i)[0];
-                            Rview(i)[1] += dt * Pview(i)[1];
-                            Rview(i)[2] += dt * Pview(i)[2];
-
-                            // Half-step velocity update (kick)
-                            vx = Pview(i)[0];
-                            vy = Pview(i)[1];
-                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * vy;
-                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * vx;
-
-                            // Check for death at each timestep
                             if (rand_gen.drand(0.0, 1.0) < death_chance) {
                                 died_mask(i) = true;
                                 has_died     = true;
                             }
-
-                            // Check for birth at each timestep
                             if (!birth_requested(i) && rand_gen.drand(0.0, 1.0) < birth_chance) {
                                 birth_requested(i) = true;
                                 birth_times(i)     = step;
                             }
                         }
                     }
+                    Pview(i)[0] = vx; Pview(i)[1] = vy; Pview(i)[2] = vz;
+                    Rview(i)[0] = rx; Rview(i)[1] = ry; Rview(i)[2] = rz;
 
                     rand_pool_bd.free_state(rand_gen);
                 });
@@ -272,7 +285,6 @@ int main(int argc, char* argv[]) {
             IpplTimings::startTimer(stage2Timer);
 
             // 2a. Destroy dead particles
-            // Always call destroy (even with 0) — it contains an allreduce
             P->destroy(died_mask, num_died);
 
             // 2b. Extract birth times before creating new particles
@@ -327,8 +339,8 @@ int main(int argc, char* argv[]) {
                             double vx = Pview(i)[0];
                             double vy = Pview(i)[1];
 
-                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * vy;
-                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * vx;
+                            Pview(i)[0] += kick * vy;
+                            Pview(i)[1] -= kick * vx;
 
                             Rview(i)[0] += dt * Pview(i)[0];
                             Rview(i)[1] += dt * Pview(i)[1];
@@ -336,8 +348,8 @@ int main(int argc, char* argv[]) {
 
                             vx = Pview(i)[0];
                             vy = Pview(i)[1];
-                            Pview(i)[0] += 0.5 * dt * B * Qview(i) * vy;
-                            Pview(i)[1] -= 0.5 * dt * B * Qview(i) * vx;
+                            Pview(i)[0] += kick * vy;
+                            Pview(i)[1] -= kick * vx;
                         }
 
                         rand_pool_bd.free_state(rand_gen);
@@ -351,11 +363,29 @@ int main(int argc, char* argv[]) {
                 << " created and caught up" << endl;
 
             // ============================================================
-            // STAGE 3: Tree-Based Load Balance
+            // STAGE 3: Tree-Based Load Balance (adaptive or unconditional)
             // ============================================================
             IpplTimings::startTimer(stage3Timer);
 
-            P->getLayout().loadbalance(*P);
+            bool do_lb = true;
+            double imbalance = 0.0;
+
+            if (adaptive_lb) {
+                // Wait for the non-blocking allreduce that was overlapping with Stage 1 + 2
+                MPI_Wait(&req_max, MPI_STATUS_IGNORE);
+                MPI_Wait(&req_sum, MPI_STATUS_IGNORE);
+
+                double avg = static_cast<double>(lb_total_count) / ippl::Comm->size();
+                imbalance = (avg > 0.0) ? static_cast<double>(lb_max_count) / avg : 1.0;
+                do_lb = (imbalance > lb_threshold);
+            }
+
+            if (do_lb) {
+                P->getLayout().loadbalance(*P);
+                lb_triggered++;
+            } else {
+                lb_skipped++;
+            }
 
             IpplTimings::stopTimer(stage3Timer);
 
@@ -365,11 +395,37 @@ int main(int argc, char* argv[]) {
             ippl::Comm->reduce(local_alive, global_alive, 1, std::plus<size_type>());
 
             if (ippl::Comm->rank() == 0) {
-                msg << "  Stage 3: " << global_alive << " particles globally after load balance" << endl;
+                if (adaptive_lb) {
+                    msg << "  Stage 3: " << global_alive << " particles globally"
+                        << " (imbalance=" << imbalance
+                        << (do_lb ? ", LB triggered)" : ", LB skipped)") << endl;
+                } else {
+                    msg << "  Stage 3: " << global_alive << " particles globally after load balance" << endl;
+                }
+            }
+
+            // Kick off next non-blocking imbalance check (overlaps with next block's Stage 1)
+            if (adaptive_lb) {
+                lb_local_count = P->getLocalNum();
+                MPI_Iallreduce(&lb_local_count, &lb_max_count, 1, MPI_UNSIGNED_LONG_LONG,
+                               MPI_MAX, MPI_COMM_WORLD, &req_max);
+                MPI_Iallreduce(&lb_local_count, &lb_total_count, 1, MPI_UNSIGNED_LONG_LONG,
+                               MPI_SUM, MPI_COMM_WORLD, &req_sum);
             }
         }
 
+        // Clean up last pending non-blocking allreduce
+        if (adaptive_lb) {
+            MPI_Wait(&req_max, MPI_STATUS_IGNORE);
+            MPI_Wait(&req_sum, MPI_STATUS_IGNORE);
+        }
+
         IpplTimings::stopTimer(timeBlockTimer);
+
+        if (adaptive_lb) {
+            msg << "Adaptive LB: triggered " << lb_triggered << " times, skipped "
+                << lb_skipped << " times (threshold=" << lb_threshold << ")" << endl;
+        }
 
         msg << "Time-block simulation completed. All particles advanced " << nt << " timesteps."
             << endl;
